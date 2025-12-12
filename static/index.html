@@ -1,0 +1,1178 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Email Accounts Manager</title>
+    <style>
+        :root {
+            /* 主题色彩 */
+            --default-primary: #0f766e;
+            --default-secondary: #0891b2;
+            --default-bg: #f8fafc;
+            --default-surface: #ffffff;
+            --default-text: #111827;
+            --default-muted: #6b7280;
+            --default-border: #e5e7eb;
+
+            --blue-primary: #2563eb;
+            --blue-secondary: #3b82f6;
+            --blue-bg: #f0f9ff;
+            --blue-surface: #ffffff;
+            --blue-text: #1e3a8a;
+            --blue-muted: #64748b;
+            --blue-border: #dbeafe;
+
+            --dark-primary: #10b981;
+            --dark-secondary: #059669;
+            --dark-bg: #111827;
+            --dark-surface: #1f2937;
+            --dark-text: #f9fafb;
+            --dark-muted: #9ca3af;
+            --dark-border: #374151;
+
+            --gray-primary: #6b7280;
+            --gray-secondary: #4b5563;
+            --gray-bg: #f9fafb;
+            --gray-surface: #ffffff;
+            --gray-text: #111827;
+            --gray-muted: #6b7280;
+            --gray-border: #e5e7eb;
+
+            /* 当前主题变量 */
+            --primary: var(--default-primary);
+            --secondary: var(--default-secondary);
+            --bg: var(--default-bg);
+            --surface: var(--default-surface);
+            --text: var(--default-text);
+            --muted: var(--default-muted);
+            --border: var(--default-border);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* 顶部 Header */
+        .header {
+            height: 60px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            flex-shrink: 0;
+            z-index: 100;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header-logo {
+            font-size: 24px;
+        }
+
+        .header-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 0;
+        }
+
+        .header-center {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            max-width: 500px;
+        }
+
+        .search-combo {
+            display: flex;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            overflow: hidden;
+            width: 100%;
+        }
+
+        .search-field {
+            padding: 8px 12px;
+            border: none;
+            background: transparent;
+            color: #ffffff;
+            outline: none;
+            font-size: 14px;
+        }
+
+        .search-field option {
+            background: var(--surface);
+            color: var(--text);
+        }
+
+        .search-input {
+            flex: 1;
+            border-left: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .theme-selector {
+            padding: 6px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            font-size: 14px;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .theme-selector option {
+            background: var(--surface);
+            color: var(--text);
+        }
+
+        .btn {
+            padding: 4px 8px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn:hover {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn:disabled:hover {
+            background: var(--surface);
+            color: var(--text);
+            border-color: var(--border);
+        }
+
+        
+        /* 主体布局 */
+        .main-container {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .left-panel {
+            width: 430px;
+            min-width: 430px;
+            max-width: 600px;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .resizer {
+            width: 4px;
+            background: var(--border);
+            cursor: col-resize;
+            position: relative;
+            transition: background-color 0.2s;
+        }
+
+        .resizer:hover {
+            background: var(--primary);
+        }
+
+        .resizer::before {
+            content: '||';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: var(--muted);
+            font-size: 12px;
+            opacity: 0.6;
+        }
+
+        .right-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: var(--bg);
+        }
+
+        /* 左侧账号列表 */
+        .accounts-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .accounts-toolbar {
+            padding: 12px 16px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .accounts-search {
+            flex: 1;
+            padding: 6px 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 14px;
+        }
+
+        .accounts-toolbar button {
+            padding: 6px 12px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .accounts-toolbar button:hover {
+            background: var(--bg);
+        }
+
+        /* 批量操作栏 */
+        .bulk-actions-bar {
+            padding: 8px 16px;
+            background: var(--bg);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+        }
+
+        .bulk-actions-bar.hidden {
+            display: none;
+        }
+
+        .selected-count {
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        .bulk-action-btn {
+            padding: 4px 6px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--surface);
+            color: var(--text);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .bulk-action-btn:hover:not(:disabled) {
+            background: var(--primary);
+            color: #ffffff;
+            border-color: var(--primary);
+        }
+
+        .bulk-action-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .bulk-action-btn.danger:hover:not(:disabled) {
+            background: #dc2626;
+            border-color: #dc2626;
+        }
+
+        .accounts-list {
+            flex: 1;
+            overflow: auto;
+        }
+
+        .accounts-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .accounts-table th {
+            background: var(--surface);
+            padding: 8px 12px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 12px;
+            color: var(--muted);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .accounts-table td {
+            padding: 6px 12px;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+            height: 36px;
+        }
+
+        .account-row {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .account-row:hover {
+            background: var(--bg);
+        }
+
+        .account-row.selected {
+            background: #e3f2fd;
+        }
+
+        [data-theme="dark"] .account-row.selected {
+            background: rgba(16, 185, 129, 0.15);
+        }
+
+        [data-theme="blue"] .account-row.selected {
+            background: #e3f2fd;
+        }
+
+        [data-theme="gray"] .account-row.selected {
+            background: #f5f5f5;
+        }
+
+        /* 账号登录状态颜色 */
+        .account-row[data-status="登录成功"] {
+            border-left: 3px solid #4caf50;
+        }
+
+        .account-row[data-status="登录失败"] {
+            border-left: 3px solid #f44336;
+        }
+
+        .account-row[data-status="未登录"] {
+            border-left: 3px solid #ff9800;
+        }
+
+        .account-row[data-status="未知"] {
+            border-left: 3px solid #9e9e9e;
+        }
+
+        .account-checkbox {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+
+        .account-actions {
+            display: flex;
+            gap: 4px;
+        }
+
+        .action-btn {
+            padding: 2px 6px;
+            border: none;
+            border-radius: 3px;
+            background: transparent;
+            color: var(--muted);
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .action-btn:hover {
+            background: rgba(0, 0, 0, 0.1);
+            color: var(--text);
+        }
+
+        .accounts-pagination {
+            padding: 8px 16px;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+            height: 36px;
+        }
+
+        .page-info {
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .page-size {
+            padding: 4px 8px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 14px;
+        }
+
+        /* 邮件分页器样式 */
+        .mails-pagination {
+            padding: 6px 16px;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+            height: 36px;
+        }
+
+        .mail-page-info {
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .mail-page-size {
+            padding: 4px 8px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 14px;
+        }
+
+        /* 右侧邮件区域 */
+        .mails-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .mails-top {
+            height: 50%;
+            display: flex;
+            flex-direction: column;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .mails-bottom {
+            height: 50%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* 邮件列表区域 */
+        .mails-tabs {
+            display: flex;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .mails-tab {
+            padding: 12px 20px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+            font-size: 14px;
+        }
+
+        .mails-tab:hover {
+            background: var(--bg);
+        }
+
+        .mails-tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+        .mails-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 0 0;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .search-combo {
+            display: flex;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .search-field-select {
+            padding: 6px 8px;
+            border: none;
+            background: transparent;
+            color: var(--text);
+            outline: none;
+            font-size: 14px;
+            border-right: 1px solid var(--border);
+        }
+
+        .search-field-select option {
+            background: var(--surface);
+            color: var(--text);
+        }
+
+        .mails-search {
+            flex: 1;
+            padding: 3px 6px;
+            border: none;
+            background: transparent;
+            color: var(--text);
+            outline: none;
+            font-size: 14px;
+        }
+
+        .compose-btn {
+            padding: 4px 16px;
+            background: var(--primary);
+            color: #ffffff;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background-color 0.2s;
+            white-space: nowrap;
+            min-width: 60px;
+            text-align: center;
+        }
+
+        .compose-btn:hover {
+            background: var(--secondary);
+        }
+
+        .mails-list {
+            flex: 1;
+            overflow: auto;
+        }
+
+        .mails-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .mails-table th {
+            background: var(--surface);
+            padding: 0 0;
+            text-align: left;
+            font-weight: 600;
+            font-size: 12px;
+            height: 30px;
+            color: var(--muted);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .mails-table td {
+            padding: 0 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+            height: 31px;
+        }
+
+        .mail-row {
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .mail-row:hover {
+            background: var(--bg);
+        }
+
+        .mail-row.selected {
+            background: #e3f2fd;
+        }
+
+        [data-theme="dark"] .mail-row.selected {
+            background: rgba(16, 185, 129, 0.15);
+        }
+
+        [data-theme="blue"] .mail-row.selected {
+            background: #e3f2fd;
+        }
+
+        [data-theme="gray"] .mail-row.selected {
+            background: #f5f5f5;
+        }
+
+        .mail-checkbox {
+            width: 16px;
+            height: 16px;
+        }
+
+        .mail-subject {
+            font-weight: 500;
+            color: var(--text);
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 120px;
+            max-width: 750px;
+            line-height: 1.2;
+        }
+
+        /* 主题列自适应宽度 */
+        .mails-table td:nth-child(3) {
+            max-width: 300px;
+            min-width: 150px;
+        }
+
+        .mail-preview {
+            font-size: 12px;
+            color: var(--muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .mail-meta {
+            font-size: 12px;
+            color: var(--muted);
+            white-space: nowrap;
+        }
+
+        /* 邮件预览区域 */
+        .mail-preview-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .mail-preview-header {
+            padding: 16px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .mail-preview-subject {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 8px;
+        }
+
+        .mail-preview-info {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .mail-preview-content {
+            flex: 1;
+            padding: 16px;
+            overflow: auto;
+            background: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--muted);
+            font-size: 16px;
+        }
+
+        .mail-download-overlay {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        
+        .mail-download-overlay {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .mail-download-content {
+            text-align: center;
+        }
+
+        .mail-download-content p {
+            margin-bottom: 16px;
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        /* 邮件内容隔离容器 - 使用iframe完全隔离 */
+        .mail-content-iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+            background: white;
+        }
+
+        .mail-content-wrapper {
+            all: initial;
+            font-family: inherit;
+            font-size: 14px;
+            line-height: 1.6;
+            color: var(--text);
+            overflow: auto;
+            max-height: 100%;
+            padding: 8px;
+            border: 1px solid #eee;
+            border-radius: 4px;
+            background: white;
+        }
+
+        .mail-content-wrapper * {
+            box-sizing: border-box !important;
+            max-width: 100% !important;
+        }
+
+        .mail-content-wrapper img {
+            max-width: 100% !important;
+            height: auto !important;
+        }
+
+        .mail-content-wrapper table {
+            max-width: 100% !important;
+            overflow-x: auto;
+            display: block;
+        }
+
+        .mail-content-wrapper a {
+            color: #1976d2 !important;
+            text-decoration: underline !important;
+        }
+
+        .mail-content-wrapper a:hover {
+            text-decoration: none !important;
+        }
+
+        /* 强制重置所有可能的样式污染 */
+        .mail-content-wrapper *,
+        .mail-content-wrapper *::before,
+        .mail-content-wrapper *::after {
+            box-sizing: border-box !important;
+            background: transparent !important;
+            background-image: none !important;
+            border: none !important;
+            outline: none !important;
+            box-shadow: none !important;
+            text-shadow: none !important;
+            float: none !important;
+            position: static !important;
+            transform: none !important;
+            filter: none !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            clip: auto !important;
+            clip-path: none !important;
+        }
+
+        /* 颜色重置 */
+        .mail-content-wrapper div,
+        .mail-content-wrapper span,
+        .mail-content-wrapper p,
+        .mail-content-wrapper td,
+        .mail-content-wrapper th,
+        .mail-content-wrapper li {
+            background: transparent !important;
+            color: #333 !important;
+        }
+
+        /* 字体重置 */
+        .mail-content-wrapper {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+        }
+
+        .download-btn {
+            padding: 12px 24px;
+            background: var(--primary);
+            color: #ffffff;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        /* 右键菜单 */
+        .context-menu {
+            position: fixed;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            padding: 4px 0;
+            z-index: 1000;
+            display: none;
+        }
+
+        .context-menu-item {
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.2s;
+            position: relative;
+        }
+
+        .context-menu-item:hover {
+            background: var(--bg);
+        }
+
+        .context-menu-item.danger {
+            color: #e74c3c;
+        }
+
+        .context-menu-item.danger:hover {
+            background: #fee;
+            color: #c0392b;
+        }
+
+        .context-menu-separator {
+            height: 1px;
+            background: var(--border);
+            margin: 4px 0;
+        }
+
+        .menu-icon {
+            margin-right: 8px;
+            width: 16px;
+            display: inline-block;
+            text-align: center;
+        }
+
+        .submenu-arrow {
+            margin-left: auto;
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        .sub-menu {
+            position: relative;
+        }
+
+        .context-submenu {
+            position: absolute;
+            left: 100%;
+            top: 0;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            padding: 4px 0;
+            z-index: 1001;
+            display: none;
+            min-width: 120px;
+        }
+
+        .sub-menu:hover .context-submenu {
+            display: block;
+        }
+
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--muted);
+        }
+
+        /* 暗色主题 */
+        [data-theme="dark"] {
+            --primary: var(--dark-primary);
+            --secondary: var(--dark-secondary);
+            --bg: var(--dark-bg);
+            --surface: var(--dark-surface);
+            --text: var(--dark-text);
+            --muted: var(--dark-muted);
+            --border: var(--dark-border);
+        }
+
+        /* 蓝色主题 */
+        [data-theme="blue"] {
+            --primary: var(--blue-primary);
+            --secondary: var(--blue-secondary);
+            --bg: var(--blue-bg);
+            --surface: var(--blue-surface);
+            --text: var(--blue-text);
+            --muted: var(--blue-muted);
+            --border: var(--blue-border);
+        }
+
+        /* 灰色主题 */
+        [data-theme="gray"] {
+            --primary: var(--gray-primary);
+            --secondary: var(--gray-secondary);
+            --bg: var(--gray-bg);
+            --surface: var(--gray-surface);
+            --text: var(--gray-text);
+            --muted: var(--gray-muted);
+            --border: var(--gray-border);
+        }
+    </style>
+</head>
+<body data-theme="default">
+    <!-- 顶部 Header -->
+    <header class="header">
+        <div class="header-left">
+            <span class="header-logo">📧</span>
+            <h1 class="header-title">Email Accounts Manager</h1>
+        </div>
+
+        <div class="header-center">
+            <div class="search-combo">
+                <select class="search-field" id="searchField">
+                    <option value="email">邮箱</option>
+                    <option value="recovery_email">辅助邮箱</option>
+                    <option value="phone">电话</option>
+                    <option value="note">备注</option>
+                </select>
+                <input type="text" class="search-field search-input" id="searchInput" placeholder="输入搜索内容...">
+            </div>
+        </div>
+
+        <div class="header-right">
+            <select class="theme-selector" id="themeSelector">
+                <option value="default">Default</option>
+                <option value="blue">Blue</option>
+                <option value="dark">Dark</option>
+                <option value="gray">Gray</option>
+            </select>
+            <button class="btn" id="addAccountBtn">新增</button>
+            <button class="btn" id="settingsBtn">设置</button>
+        </div>
+    </header>
+
+    <!-- 主体容器 -->
+    <div class="main-container">
+        <!-- 左侧面板：账号列表 -->
+        <div class="left-panel">
+            <div class="accounts-container">
+  
+                <!-- 批量操作栏 -->
+                <div class="bulk-actions-bar hidden" id="bulkActionsBar">
+                    <span>已选中 <span class="selected-count" id="selectedCount">0</span> 项</span>
+                    <button class="bulk-action-btn" id="bulkDeleteBtn">批量删除</button>
+                    <button class="bulk-action-btn" id="bulkNoteBtn">批量备注</button>
+                    <button class="bulk-action-btn" id="bulkLoginBtn">批量登录</button>
+                    <button class="bulk-action-btn" id="bulkSyncBtn">批量读取邮件</button>
+                    <input type="text" class="accounts-search" id="bulkNoteInput" placeholder="批量备注内容" style="width: 200px;">
+                </div>
+
+                <div class="accounts-list">
+                    <table class="accounts-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px;">
+                                    <input type="checkbox" class="account-checkbox" id="selectAllAccounts">
+                                </th>
+                                <th style="width: 60px;">序号</th>
+                                <th style="text-align: left;">邮箱</th>
+                            </tr>
+                        </thead>
+                        <tbody id="accountsTableBody">
+                            <tr>
+                                <td colspan="3" class="mail-placeholder">加载账号列表中...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="accounts-pagination">
+                    <span class="page-info" id="pageInfo">第 1/1 页</span>
+                    <button id="prevPageBtn" class="btn">上一页</button>
+                    <button id="nextPageBtn" class="btn">下一页</button>
+                    <span>每页</span>
+                    <select class="page-size" id="pageSizeSelect">
+                        <option value="20">20</option>
+                        <option value="50" selected>50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                        <option value="1000">1000</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- 拖拽分割条 -->
+        <div class="resizer" id="resizer"></div>
+
+        <!-- 右侧面板：邮件区域 -->
+        <div class="right-panel">
+            <div class="mails-container">
+                <!-- 上半部：邮件列表 -->
+                <div class="mails-top">
+                    <div class="mails-tabs">
+                        <div class="mails-tab active" data-tab="current" id="currentMailTab">当前邮件</div>
+                        <div class="mails-tab" data-tab="search">邮件全搜</div>
+                    </div>
+
+                    <div class="mails-toolbar">
+                        <div class="search-combo">
+                            <select class="search-field-select" id="mailSearchField">
+                                <option value="subject">主题</option>
+                                <option value="from">发件人</option>
+                                <option value="to">收件人</option>
+                            </select>
+                            <input type="text" class="mails-search" id="mailSearch" placeholder="搜索邮件...">
+                        </div>
+                        <button class="compose-btn">写邮件</button>
+                    </div>
+
+                    <div class="mails-list">
+                        <table class="mails-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 40px;">
+                                        <input type="checkbox" class="mail-checkbox" id="selectAllMails">
+                                    </th>
+                                    <th style="width: 50px;">序号</th>
+                                    <th>主题</th>
+                                    <th style="width: 200px;">发件人</th>
+                                    <th style="width: 150px;">预览</th>
+                                    <th style="width: 120px;">时间</th>
+                                    <th style="width: 80px;">大小</th>
+                                </tr>
+                            </thead>
+                            <tbody id="mailsListBody">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 邮件分页器 -->
+                <div class="mails-pagination">
+                    <span class="mail-page-info" id="mailPageInfo">第 1/1 页</span>
+                    <button id="mailPrevPageBtn" class="btn">上一页</button>
+                    <button id="mailNextPageBtn" class="btn">下一页</button>
+                    <span>每页</span>
+                    <select class="mail-page-size" id="mailPageSizeSelect">
+                        <option value="20">20</option>
+                        <option value="50" selected>50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                    </select>
+                </div>
+
+                <!-- 下半部：邮件内容预览 -->
+                <div class="mails-bottom">
+                    <div class="mail-preview-container">
+                        <div class="mail-preview-header">
+                            <div class="mail-preview-subject" id="mailSubject">请选择邮件</div>
+                            <div class="mail-preview-info">
+                                <span id="mailFrom"></span>
+                                <span id="mailTo"></span>
+                                <span id="mailTime"></span>
+                            </div>
+                        </div>
+                        <div class="mail-preview-content" id="mailContent">
+                            请选择邮件预览内容
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 账号右键菜单 -->
+    <div class="context-menu" id="accountContextMenu">
+        <div class="context-menu-item" data-action="login">
+            <span class="menu-icon">🔑</span>
+            登录
+        </div>
+        <div class="context-menu-item" data-action="copy-email">
+            <span class="menu-icon">📋</span>
+            复制邮箱
+        </div>
+        <div class="context-menu-item" data-action="helpers">
+            <span class="menu-icon">⚙️</span>
+            辅助邮箱/密码
+        </div>
+        <div class="context-menu-item sub-menu" data-action="sync-mails">
+            <span class="menu-icon">🔄</span>
+            同步邮箱
+            <span class="submenu-arrow">▶</span>
+            <div class="context-submenu" id="syncSubmenu">
+                <div class="context-menu-item" data-action="sync-all">全部邮件</div>
+                <div class="context-menu-item" data-action="sync-recent">最近7天</div>
+                <div class="context-menu-item" data-action="sync-today">今天</div>
+            </div>
+        </div>
+        <div class="context-menu-item" data-action="view-history">
+            <span class="menu-icon">📜</span>
+            查看历史版本
+        </div>
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-item danger" data-action="delete">
+            <span class="menu-icon">🗑️</span>
+            删除
+        </div>
+    </div>
+
+    <!-- 邮件右键菜单 -->
+    <div class="context-menu" id="mailContextMenu">
+        <div class="context-menu-item" data-action="download-mail">下载此邮件</div>
+        <div class="context-menu-item" data-action="download-selected">下载选中的所有邮件</div>
+        <div class="context-menu-item" data-action="delete-mail">删除此邮件</div>
+        <div class="context-menu-item" data-action="delete-selected">删除选中的所有邮件</div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
