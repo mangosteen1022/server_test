@@ -2,7 +2,6 @@
 
 from .normalizers import (
     normalize_aliases,
-    norm_alias_list,
     normalize_list,
     norm_email,
     norm_email_list,
@@ -15,7 +14,6 @@ from .snapshot import fetch_current_state, insert_version_snapshot, get_recovery
 
 __all__ = [
     "normalize_aliases",
-    "norm_alias_list",
     "normalize_list",
     "norm_email",
     "norm_email_list",

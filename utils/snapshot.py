@@ -15,7 +15,6 @@ def fetch_current_state(db: sqlite3.Connection, account_id: int) -> dict:
         norm_birthday,
         norm_email_list,
         norm_phone_digits_list,
-        norm_alias_list,
     )
 
     a = db.execute(
@@ -72,6 +71,11 @@ def insert_version_snapshot(db: sqlite3.Connection, account_id: int, note: Optio
     if not a:
         raise HTTPException(404, f"account {account_id} not found when snapshot")
 
+    current_max = db.execute(
+        "SELECT MAX(version) FROM account_version WHERE group_id = ?",
+        (a["group_id"],)
+    ).fetchone()[0]
+    new_version = (current_max or 0) + 1
     # 获取该组的所有邮箱（主邮箱+别名邮箱）
     all_emails = [
         r["email"]
@@ -100,7 +104,7 @@ def insert_version_snapshot(db: sqlite3.Connection, account_id: int, note: Optio
         """,
         (
             a["group_id"],
-            a["version"],
+            new_version,
             json.dumps(all_emails, ensure_ascii=False),  # 该组的所有邮箱（主邮箱+别名）
             a["password"],
             a["status"],

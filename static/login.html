@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>系统登录 - 邮箱管理系统</title>
+    <style>
+        :root {
+            --primary-color: #0f766e;
+            --primary-hover: #0d6efd;
+            --bg-color: #f3f4f6;
+            --card-bg: #ffffff;
+            --text-color: #1f2937;
+            --border-color: #e5e7eb;
+            --error-color: #ef4444;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .login-container {
+            background-color: var(--card-bg);
+            padding: 2.5rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            width: 100%;
+            max-width: 360px;
+        }
+
+        .login-header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .login-header h2 {
+            margin: 0;
+            color: var(--text-color);
+            font-size: 1.5rem;
+            font-weight: 600;
+        }
+
+        .login-header p {
+            margin-top: 0.5rem;
+            color: #6b7280;
+            font-size: 0.875rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-color);
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 1rem;
+            box-sizing: border-box; /* 关键：防止padding撑大宽度 */
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.1);
+        }
+
+        .btn-submit {
+            width: 100%;
+            background-color: var(--primary-color);
+            color: white;
+            padding: 0.75rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+
+        .btn-submit:hover {
+            background-color: #0d6963;
+        }
+
+        .btn-submit:disabled {
+            background-color: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        .error-message {
+            background-color: #fef2f2;
+            color: var(--error-color);
+            padding: 0.75rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            margin-bottom: 1.5rem;
+            display: none; /* 默认隐藏 */
+            text-align: center;
+            border: 1px solid #fecaca;
+        }
+
+        .footer {
+            margin-top: 1.5rem;
+            text-align: center;
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+    </style>
+</head>
+<body>
+
+<div class="login-container">
+    <div class="login-header">
+        <h2>账号登录</h2>
+        <p>请输入您的管理员或用户账号</p>
+    </div>
+
+    <div id="errorMsg" class="error-message"></div>
+
+    <form id="loginForm" onsubmit="handleLogin(event)">
+        <div class="form-group">
+            <label for="username">用户名</label>
+            <input type="text" id="username" name="username" placeholder="admin" required autofocus>
+        </div>
+
+        <div class="form-group">
+            <label for="password">密码</label>
+            <input type="password" id="password" name="password" placeholder="••••••" required>
+        </div>
+
+        <button type="submit" class="btn-submit" id="submitBtn">立即登录</button>
+    </form>
+
+    <div class="footer">
+        © 2024 Email Management System
+    </div>
+</div>
+
+<script>
+    // 检查是否已经登录，如果已登录直接跳转首页
+    if (localStorage.getItem('token')) {
+        window.location.href = '/index.html';
+    }
+
+    async function handleLogin(event) {
+        event.preventDefault(); // 阻止表单默认提交行为
+
+        const usernameInput = document.getElementById('username');
+        const passwordInput = document.getElementById('password');
+        const submitBtn = document.getElementById('submitBtn');
+        const errorMsg = document.getElementById('errorMsg');
+
+        // 重置状态
+        errorMsg.style.display = 'none';
+        submitBtn.disabled = true;
+        submitBtn.textContent = '登录中...';
+
+        const username = usernameInput.value.trim();
+        const password = passwordInput.value; // 密码通常不trim
+
+        // 构造 x-www-form-urlencoded 数据 (FastAPI OAuth2Form 要求)
+        const formData = new URLSearchParams();
+        formData.append('username', username);
+        formData.append('password', password);
+
+        try {
+            const response = await fetch('/auth/token', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: formData
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                // 1. 存储 Token 和用户信息
+                localStorage.setItem('token', data.access_token);
+                localStorage.setItem('token_type', data.token_type); // 通常是 "bearer"
+
+                // 如果后端返回了 role 和 username，也存起来
+                if (data.role) localStorage.setItem('role', data.role);
+                if (data.username) localStorage.setItem('username', data.username);
+
+                // 2. 跳转到主页
+                window.location.href = '/index.html';
+            } else {
+                // 显示后端返回的错误信息
+                showError(data.detail || '登录失败，请检查用户名或密码');
+            }
+        } catch (error) {
+            console.error('Login error:', error);
+            showError('网络连接失败，请检查服务器状态');
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = '立即登录';
+        }
+    }
+
+    function showError(msg) {
+        const errorDiv = document.getElementById('errorMsg');
+        errorDiv.textContent = msg;
+        errorDiv.style.display = 'block';
+    }
+</script>
+
+</body>
+</html>

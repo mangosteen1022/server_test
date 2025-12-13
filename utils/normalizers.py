@@ -20,11 +20,6 @@ def normalize_aliases(values: Optional[List[str]]) -> List[str]:
     return out
 
 
-def norm_alias_list(values: Optional[List[str]]) -> List[str]:
-    """规范化别名列表（小写，排序）"""
-    return sorted({(v or "").strip().lower() for v in (values or []) if (v or "").strip()})
-
-
 def normalize_list(values: Optional[List[str]]) -> List[str]:
     """规范化字符串列表（去重，保留顺序）"""
     if not values:

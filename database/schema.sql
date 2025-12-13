@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   birthday     TEXT,
   version      INTEGER NOT NULL DEFAULT 1,
   created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc')),
-  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc'))
+  updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc')),
+  is_delete    INTEGER NOT NULL DEFAULT 0
+
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
 CREATE INDEX IF NOT EXISTS idx_accounts_group_id ON accounts(group_id);

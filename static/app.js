@@ -25,8 +25,38 @@ const AppState = {
 };
 
 // ==================== API Configuration ====================
-const API_BASE = '..'; // 回到根路径访问API
+const API_BASE = ''; // 回到根路径访问API
+const originalFetch = window.fetch;
+window.fetch = async function(url, options = {}) {
+    // 1. 自动添加 Authorization Header
+    const token = localStorage.getItem('token');
+    if (token) {
+        options.headers = options.headers || {};
+        // 确保 headers 是对象
+        if (options.headers instanceof Headers) {
+            options.headers.append('Authorization', `Bearer ${token}`);
+        } else {
+            options.headers['Authorization'] = `Bearer ${token}`;
+        }
+    }
 
+    // 2. 发送请求
+    try {
+        const response = await originalFetch(url, options);
+
+        // 3. 拦截 401 (未授权/Token过期)
+        if (response.status === 401) {
+            console.warn('Token expired or invalid, redirecting to login...');
+            localStorage.removeItem('token'); // 清除失效 Token
+            window.location.href = '/login.html';
+            return response; // 或者抛出错误
+        }
+
+        return response;
+    } catch (error) {
+        throw error;
+    }
+};
 const api = {
     // 账号相关API
     accounts: {
@@ -2052,6 +2082,34 @@ function initEventListeners() {
     });
 }
 
+
+function initHeaderUser() {
+    // 1. 显示用户信息
+    const username = localStorage.getItem('username') || '用户';
+    const role = localStorage.getItem('role') || '';
+
+    const infoSpan = document.getElementById('headerUserInfo');
+    if (infoSpan) {
+        // 如果是管理员，显示角色；如果是普通用户，只显示名字
+        const roleDisplay = role === 'admin' ? ' (管理员)' : '';
+        infoSpan.textContent = `${username}${roleDisplay}`;
+    }
+
+    // 2. 绑定登出事件
+    const logoutBtn = document.getElementById('logoutBtn');
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', handleLogout);
+    }
+}
+
+function handleLogout() {
+    if (confirm('确定要退出登录吗？')) {
+        // 清除所有 LocalStorage
+        localStorage.clear();
+        // 跳转回登录页
+        window.location.href = '/login.html';
+    }
+}
 // ==================== Application Initialization ====================
 function init() {
     // 首先检查API对象是否正确定义
@@ -2067,6 +2125,7 @@ function init() {
     initTheme();
     initResizer();
     initEventListeners();
+    initHeaderUser();
     loadSettings();
     loadAccounts();
 }

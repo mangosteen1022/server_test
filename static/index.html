@@ -4,6 +4,16 @@
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width,initial-scale=1"/>
     <title>Email Accounts Manager</title>
+    <script>
+        (function() {
+            // 立即检查 Token
+            const token = localStorage.getItem('token');
+            if (!token) {
+                // sessionStorage.setItem('redirect', window.location.href);
+                window.location.href = '/login.html';
+            }
+        })();
+    </script>
     <style>
         :root {
             /* 主题色彩 */
@@ -987,6 +997,7 @@
         </div>
 
         <div class="header-right">
+            <span id="headerUserInfo" style="font-size: 14px; margin-right: 8px; opacity: 0.9;"></span>
             <select class="theme-selector" id="themeSelector">
                 <option value="default">Default</option>
                 <option value="blue">Blue</option>
@@ -995,6 +1006,7 @@
             </select>
             <button class="btn" id="addAccountBtn">新增</button>
             <button class="btn" id="settingsBtn">设置</button>
+            <button class="btn" id="logoutBtn" style="border-color: rgba(255,255,255,0.4); background: rgba(0,0,0,0.1);">退出</button>
         </div>
     </header>
 

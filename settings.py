@@ -40,3 +40,7 @@ DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", 20))
 DB_POOL_TIMEOUT = int(os.environ.get("DB_POOL_TIMEOUT", 5))
 DB_TIMEOUT = int(os.environ.get("DB_TIMEOUT", 30))
 
+# JWT 配置
+SECRET_KEY = "mangosteen-system-secret-key-change-me"  # 请务必修改
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # token有效期：24小时
