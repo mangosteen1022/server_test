@@ -1,7 +1,7 @@
 """Pydantic 模型"""
 
 from .account import AccountCreate, AccountUpdate, StatusIn, RestoreBody, BatchResult
-from .mail import MailBodyIn, MailMessageCreate, MailMessageUpdate, AttachmentAdd, MailSearchRequest
+from .mail import MailBodyIn, MailSearchRequest
 
 __all__ = [
     "AccountCreate",
@@ -10,8 +10,5 @@ __all__ = [
     "RestoreBody",
     "BatchResult",
     "MailBodyIn",
-    "MailMessageCreate",
-    "MailMessageUpdate",
-    "AttachmentAdd",
     "MailSearchRequest",
 ]

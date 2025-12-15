@@ -6,7 +6,6 @@ import time
 import json
 import re
 import threading
-from PyQt5.QtCore import QRunnable
 from bs4 import BeautifulSoup
 
 from services.core.CheckProxy import CheckProxyByProxyGenerate
@@ -20,7 +19,7 @@ import execjs
 email_client = EmailClientByApi()
 
 
-class Worker(QRunnable):
+class Worker:
     error_code = {
         "1203": "验证码错误",
         "1204": "每日收码超出限制",
@@ -1578,13 +1577,10 @@ class Worker(QRunnable):
 if __name__ == "__main__":
     info = {
         "auth_uri": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=f4a5101b-9441-48f4-968f-3ef3da7b7290&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A53100&scope=Mail.Read+Mail.Send+User.Read+offline_access+openid+profile&state=OdhnACIZEitJypNv&code_challenge=3IZbdLye2KcaegamKhMMkXMQQ1U9hr44hOjBeqQ0-2U&code_challenge_method=S256&nonce=6b2ab7fdf20d9ae0e6b518f2cc0deaa290a98ff11efd8a49c68e429ab741edef&client_info=1",
-        "email": "Cain_Mccarrell1973@msn.com",
-        "password": "knHz2hfx9",
-        "recovery_email": "Cain_Mccarrell1973@meirenyao.com",
+        "email": "xxxx@msn.com",
+        "password": "xx",
+        "recovery_email": "xxxx@meirenyao.com",
     }
     w = Worker(info)
     print(w.run())
 
-
-# # Cain_Mccarrell1973@msn.com	knHz2hfx9  cain_mccarrell1973@meirenyao.com
-# Aramys-Mcweytovar1986@msn.com	cqBe4uan6h  aramys-mcweytovar1986@believeq.com

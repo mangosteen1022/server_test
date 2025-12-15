@@ -1,12 +1,15 @@
-"""邮件业务逻辑服务 - 重构版"""
-
+"""邮件业务逻辑服务"""
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any, Tuple
 
+import requests
 from fastapi import HTTPException
-from database.factory import get_db, begin_tx, commit_tx, rollback_tx
-from models.mail import MailBodyIn, MailMessageCreate, MailMessageUpdate, MailSearchRequest, MailMessageBatchCreate
-from utils.normalizers import normalize_list
+
+import settings
+from auth.msal_client import MSALClient
+from database.factory import get_db, begin_tx, commit_tx
+from models.mail import MailBodyIn, MailSearchRequest
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -15,141 +18,52 @@ logger = get_logger(__name__)
 class MailService:
     """邮件服务"""
 
-    def __init__(self):
-        """初始化服务，不接收 db 连接"""
-        pass
-
-    def create_message(self, it: MailMessageCreate) -> Dict[str, Any]:
-        """创建邮件消息"""
-        to_all = normalize_list(it.to) + normalize_list(it.cc) + normalize_list(it.bcc)
-        seen, seq = set(), []
-        for a in to_all:
-            if a not in seen:
-                seen.add(a)
-                seq.append(a)
-        to_joined = ";".join(seq)
-
-        labels_joined = ";".join(normalize_list(it.labels))
-        attachments_count = len(it.attachments or [])
-
-        try:
-            with get_db() as db:
-                begin_tx(db)
-
-                cursor = db.execute(
-                    """
-                    INSERT INTO mail_message(
-                        group_id, account_id, msg_uid, msg_id, subject, from_addr, to_joined,
-                        folder_id, labels_joined, sent_at, received_at, size_bytes,
-                        attachments_count, flags, snippet, created_at, updated_at
-                    )
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))
-                """,
-                    (
-                        it.group_id,
-                        it.account_id,
-                        it.msg_uid,
-                        it.msg_id,
-                        it.subject or "",
-                        it.from_addr,
-                        to_joined,
-                        it.folder_id,
-                        labels_joined,
-                        it.sent_at,
-                        it.received_at,
-                        it.size_bytes,
-                        attachments_count,
-                        ";".join(it.flags or []),
-                        it.snippet or ""
-                    )
-                )
-
-                commit_tx(db)
-                return {"id": cursor.lastrowid}
-
-        except Exception as e:
-            logger.error(f"Failed to create message: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    def get_message(self, account_id: int, message_id: int) -> Optional[Dict]:
-        """获取邮件详情"""
+    def get_message(self, group_id: str, message_id: int) -> Optional[Dict]:
+        """获取邮件详情 (按 Group 查询)"""
         return self.fetch_one(
-            "SELECT * FROM mail_message WHERE account_id = ? AND id = ?",
-            (account_id, message_id)
+            "SELECT * FROM mail_message WHERE group_id = ? AND id = ?",
+            (group_id, message_id)
         )
 
-    def list_messages(self, account_id: int, params: Dict = None) -> Dict[str, Any]:
-        """获取邮件列表"""
-        query = "SELECT * FROM mail_message WHERE account_id = ?"
-        query_params = [account_id]
+    def list_messages(self, group_id: str, params: Dict = None, current_user: Dict = None) -> Dict[str, Any]:
+        """
+        获取邮件列表
+        [重构]：现在它只是 search_group_mails 的一个轻量级封装
+        """
+        if params is None:
+            params = {}
 
-        if params:
-            # 构建查询条件
-            conditions = []
-            if params.get("folder_id"):
-                conditions.append("folder_id = ?")
-                query_params.append(params["folder_id"])
-            if params.get("search"):
-                conditions.append("(subject LIKE ? OR from_addr LIKE ? OR to_joined LIKE ?)")
-                search_term = f"%{params['search']}%"
-                query_params.extend([search_term, search_term, search_term])
-            if params.get("has_attachments") is True:
-                conditions.append("attachments_count > 0")
-            if params.get("is_unread") is True:
-                conditions.append("flags NOT LIKE '%Read%'")
-            if params.get("is_flagged") is True:
-                conditions.append("flags LIKE '%Flagged%'")
+        # 为了复用 _execute_mail_search 的纯净逻辑，我们在这里先鉴权
+        if current_user and current_user["role"] != "admin":
+            if not self._has_group_permission(group_id, current_user["id"]):
+                return {
+                    "items": [], "total": 0, "page": params.get("page", 1), "size": params.get("size", 50), "pages": 0
+                }
 
-            if conditions:
-                query += " AND " + " AND ".join(conditions)
+        # 注意：这里做参数映射
+        search_req = MailSearchRequest(
+            query=params.get("search"),  # 对应 q 参数
+            folder_id=params.get("folder_id"),
+            has_attachments=params.get("has_attachments"),
+            is_unread=params.get("is_unread"),
+            is_flagged=params.get("is_flagged"),
+            page=params.get("page", 1),
+            size=params.get("size", 50)
+        )
 
-        query += " ORDER BY received_at DESC"
+        base_conditions = ["group_id = ?"]
+        base_params = [group_id]
 
-        # 使用分页
-        page = params.get("page", 1)
-        size = params.get("size", 50)
+        return self._execute_mail_search(base_conditions, base_params, search_req)
 
-        return self.paginate(query, page, size, tuple(query_params))
-
-    def update_message(self, account_id: int, message_id: int, data: MailMessageUpdate) -> bool:
-        """更新邮件"""
-        update_fields = []
-        update_values = []
-
-        if data.flags is not None:
-            update_fields.append("flags = ?")
-            update_values.append(";".join(data.flags))
-
-        if data.folder_id is not None:
-            update_fields.append("folder_id = ?")
-            update_values.append(data.folder_id)
-
-        if not update_fields:
-            return False
-
-        update_values.extend([account_id, message_id])
-
-        try:
-            with get_db() as db:
-                begin_tx(db)
-                db.execute(
-                    f"UPDATE mail_message SET {', '.join(update_fields)} WHERE account_id = ? AND id = ?",
-                    tuple(update_values)
-                )
-                commit_tx(db)
-                return True
-        except Exception as e:
-            logger.error(f"Failed to update message {message_id}: {str(e)}")
-            return False
-
-    def delete_message(self, account_id: int, message_id: int) -> bool:
-        """删除邮件"""
+    def delete_message(self, group_id: str, message_id: int) -> bool:
+        """删除邮件 (按 Group 查询)"""
         try:
             with get_db() as db:
                 begin_tx(db)
                 cursor = db.execute(
-                    "DELETE FROM mail_message WHERE account_id = ? AND id = ?",
-                    (account_id, message_id)
+                    "DELETE FROM mail_message WHERE group_id = ? AND id = ?",
+                    (group_id, message_id)
                 )
                 commit_tx(db)
                 return cursor.rowcount > 0
@@ -157,149 +71,84 @@ class MailService:
             logger.error(f"Failed to delete message {message_id}: {str(e)}")
             return False
 
-    def batch_create_messages(self, messages: List[MailMessageBatchCreate]) -> Dict[str, Any]:
-        """批量创建邮件"""
-        success_count = 0
-        errors = []
-
-        for idx, msg in enumerate(messages):
-            try:
-                # 转换为 MailMessageCreate
-                create_data = MailMessageCreate(
-                    group_id=msg.group_id,
-                    account_id=msg.account_id,
-                    msg_uid=msg.msg_uid,
-                    msg_id=msg.msg_id,
-                    subject=msg.subject,
-                    from_addr=msg.from_addr,
-                    to=msg.to,
-                    cc=msg.cc,
-                    bcc=msg.bcc,
-                    folder_id=msg.folder_id,
-                    labels=msg.labels,
-                    flags=msg.flags,
-                    snippet=msg.snippet
-                )
-
-                self.create_message(create_data)
-                success_count += 1
-            except Exception as e:
-                errors.append({"index": idx, "error": str(e)})
-
-        return {
-            "total": len(messages),
-            "success": success_count,
-            "errors": errors
-        }
-
-    def search_messages(self, account_id: int, search: MailSearchRequest) -> Dict[str, Any]:
-        """搜索邮件"""
-        query = "SELECT * FROM mail_message WHERE account_id = ?"
-        params = [account_id]
-
-        # 构建搜索条件
-        conditions = []
-
-        if search.query:
-            conditions.append(
-                "(subject LIKE ? OR from_addr LIKE ? OR to_joined LIKE ? OR body LIKE ?)"
-            )
-            search_term = f"%{search.query}%"
-            params.extend([search_term, search_term, search_term, search_term])
-
-        if search.folder_id:
-            conditions.append("folder_id = ?")
-            params.append(search.folder_id)
-
-        if search.from_addr:
-            conditions.append("from_addr LIKE ?")
-            params.append(f"%{search.from_addr}%")
-
-        if search.has_attachments is not None:
-            if search.has_attachments:
-                conditions.append("attachments_count > 0")
-            else:
-                conditions.append("attachments_count = 0")
-
-        if search.is_unread is not None:
-            if search.is_unread:
-                conditions.append("flags NOT LIKE '%Read%'")
-            else:
-                conditions.append("flags LIKE '%Read%'")
-
-        if search.is_flagged is not None:
-            if search.is_flagged:
-                conditions.append("flags LIKE '%Flagged%'")
-            else:
-                conditions.append("flags NOT LIKE '%Flagged%'")
-
-        if search.date_from:
-            conditions.append("received_at >= ?")
-            params.append(search.date_from)
-
-        if search.date_to:
-            conditions.append("received_at <= ?")
-            params.append(search.date_to)
-
-        if conditions:
-            query += " AND " + " AND ".join(conditions)
-
-        query += " ORDER BY received_at DESC"
-
-        return self.paginate(query, search.page or 1, search.size or 50, tuple(params))
-
-    def get_message_count_by_folder(self, account_id: int) -> Dict[str, int]:
-        """获取各文件夹的邮件数量"""
-        query = """
-            SELECT folder_id, COUNT(*) as count
-            FROM mail_message
-            WHERE account_id = ?
-            GROUP BY folder_id
-        """
-
-        with get_db() as db:
-            rows = db.execute(query, (account_id,)).fetchall()
-            return {row["folder_id"]: row["count"] for row in rows}
-
-    def get_unread_count(self, account_id: int) -> int:
-        """获取未读邮件数量"""
-        return self.fetch_value(
-            "SELECT COUNT(*) FROM mail_message WHERE account_id = ? AND flags NOT LIKE '%Read%'",
-            (account_id,)
-        ) or 0
-
-    def mark_as_read(self, account_id: int, message_ids: List[int]) -> int:
-        """标记邮件为已读"""
+    def batch_delete_messages(self, group_id: str, message_ids: List[int]) -> int:
+        """批量删除邮件"""
         if not message_ids:
             return 0
 
+        # 安全性：必须同时校验 group_id，防止跨组误删
         placeholders = ",".join(["?"] * len(message_ids))
+        query = f"DELETE FROM mail_message WHERE group_id = ? AND id IN ({placeholders})"
+
         try:
             with get_db() as db:
                 begin_tx(db)
-                # 获取当前flags
-                rows = db.execute(
-                    f"SELECT id, flags FROM mail_message WHERE account_id = ? AND id IN ({placeholders})",
-                    [account_id] + message_ids
-                ).fetchall()
-
-                # 更新flags
-                for row in rows:
-                    flags = row["flags"].split(";") if row["flags"] else []
-                    if "Read" not in flags:
-                        flags.append("Read")
-                        db.execute(
-                            "UPDATE mail_message SET flags = ? WHERE id = ?",
-                            (";".join(flags), row["id"])
-                        )
-
+                cursor = db.execute(query, [group_id] + message_ids)
                 commit_tx(db)
-                return len(rows)
+                return cursor.rowcount
         except Exception as e:
-            logger.error(f"Failed to mark messages as read: {str(e)}")
+            logger.error(f"Failed to batch delete messages: {str(e)}")
             return 0
 
-    # ==================== 私有辅助方法 ====================
+    def batch_update_flags(self, group_id: str, message_ids: List[int], action: str, flag: str) -> int:
+        """
+        批量更新邮件标志位
+        :param group_id: 组ID
+        :param message_ids: 邮件ID列表
+        :param action: 'add' (添加) 或 'remove' (移除)
+        :param flag: 标志位名称 (如 'Read', 'Flagged')
+        :return: 成功更新的记录数
+        """
+        if not message_ids:
+            return 0
+
+        # 校验 action 合法性
+        if action not in ("add", "remove"):
+            return 0
+
+        placeholders = ",".join(["?"] * len(message_ids))
+
+        try:
+            with get_db() as db:
+                begin_tx(db)
+
+                # 1. 查出当前所有选中邮件的 flags
+                rows = db.execute(
+                    f"SELECT id, flags FROM mail_message WHERE group_id = ? AND id IN ({placeholders})",
+                    [group_id] + message_ids
+                ).fetchall()
+
+                updated_count = 0
+
+                for row in rows:
+                    # 解析当前 flags (数据库存的是分号分隔字符串 "Read;Flagged")
+                    # 使用 set 自动去重且查找快
+                    current_flags = set(row["flags"].split(";") if row["flags"] else [])
+
+                    original_len = len(current_flags)
+
+                    # 2. 根据 action 修改集合
+                    if action == "add":
+                        current_flags.add(flag)
+                    elif action == "remove":
+                        if flag in current_flags:
+                            current_flags.remove(flag)
+
+                    # 3. 只有当 flags 真正发生变化时才执行 SQL 更新
+                    if len(current_flags) != original_len:
+                        new_flags_str = ";".join(sorted(current_flags))  # 排序保证存储顺序一致
+                        db.execute(
+                            "UPDATE mail_message SET flags = ? WHERE id = ?",
+                            (new_flags_str, row["id"])
+                        )
+                        updated_count += 1
+
+                commit_tx(db)
+                return updated_count
+
+        except Exception as e:
+            logger.error(f"Failed to batch update flags: {str(e)}")
+            return 0
 
     def fetch_one(self, query: str, params: Tuple = ()) -> Optional[Dict]:
         """执行查询并返回单条记录"""
@@ -322,30 +171,9 @@ class MailService:
             row = cursor.fetchone()
             return row[0] if row else None
 
-    def paginate(self, query: str, page: int, size: int, params: Tuple = ()) -> Dict[str, Any]:
-        """分页查询"""
-        offset = (page - 1) * size
-
-        # 获取总数
-        total_query = f"SELECT COUNT(*) FROM ({query}) as subq"
-        total = self.fetch_value(total_query, params) or 0
-
-        # 获取分页数据
-        paginated_query = f"{query} LIMIT ? OFFSET ?"
-        items = self.fetch_all(paginated_query, params + (size, offset))
-
-        return {
-            "items": items,
-            "total": total,
-            "page": page,
-            "size": size,
-            "pages": (total + size - 1) // size
-        }
-
     def get_detail(self, message_id: int) -> Optional[Dict]:
         """获取邮件详情"""
         with get_db() as db:
-            # 获取邮件基本信息
             mail = db.execute(
                 "SELECT * FROM mail_message WHERE id = ?",
                 (message_id,)
@@ -354,13 +182,11 @@ class MailService:
             if not mail:
                 return None
 
-            # 获取邮件正文
             body = db.execute(
                 "SELECT * FROM mail_body WHERE message_id = ?",
                 (message_id,)
             ).fetchone()
 
-            # 获取附件列表
             attachments = db.execute(
                 "SELECT * FROM mail_attachment WHERE message_id = ? ORDER BY id",
                 (message_id,)
@@ -374,16 +200,10 @@ class MailService:
 
     def get_preview(self, message_id: int) -> Optional[Dict]:
         """获取邮件预览（用于右侧显示）"""
-        with get_db() as db:
-            mail = db.execute(
-                "SELECT id, subject, from_addr, to_joined, snippet, received_at, flags, folder_id FROM mail_message WHERE id = ?",
-                (message_id,)
-            ).fetchone()
-
-            if not mail:
-                return None
-
-            return dict(mail)
+        return self.fetch_one(
+            "SELECT id, subject, from_addr, to_joined, snippet, received_at, flags, folder_id FROM mail_message WHERE id = ?",
+            (message_id,)
+        )
 
     def update_body(self, message_id: int, body_data: MailBodyIn) -> bool:
         """更新或插入邮件正文"""
@@ -408,23 +228,6 @@ class MailService:
             logger.error(f"Failed to update body for message {message_id}: {str(e)}")
             return False
 
-    def add_attachment(self, message_id: int, storage_url: str) -> Dict:
-        """添加邮件附件"""
-        try:
-            with get_db() as db:
-                begin_tx(db)
-
-                cursor = db.execute("""
-                    INSERT INTO mail_attachment (message_id, storage_url, created_at)
-                    VALUES (?, ?, datetime('now'))
-                """, (message_id, storage_url))
-
-                commit_tx(db)
-                return {"id": cursor.lastrowid}
-        except Exception as e:
-            logger.error(f"Failed to add attachment to message {message_id}: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-
     def list_attachments(self, message_id: int) -> List[Dict]:
         """列出邮件附件"""
         with get_db() as db:
@@ -435,135 +238,413 @@ class MailService:
 
             return [dict(a) for a in attachments]
 
-    def delete_attachment(self, message_id: int, attach_id: int) -> bool:
-        """删除邮件附件"""
-        try:
-            with get_db() as db:
-                begin_tx(db)
+    def _has_group_permission(self, group_id: str, user_id: int) -> bool:
+        """
+        [高效鉴权] 检查用户是否拥有该组下的任意一个账号
+        SQL 复杂度: O(1) - 仅查询关系表
+        """
+        query = """
+                SELECT 1
+                FROM accounts a
+                         JOIN project_assignments pa ON a.id = pa.account_id
+                WHERE a.group_id = ? \
+                  AND pa.user_id = ?
+                LIMIT 1 \
+                """
+        # 只要查到一条记录，就说明有权访问该组
+        return self.fetch_value(query, (group_id, user_id)) is not None
 
-                cursor = db.execute(
-                    "DELETE FROM mail_attachment WHERE message_id = ? AND id = ?",
-                    (message_id, attach_id)
-                )
+    def search_group_mails(self, group_id: str, search: MailSearchRequest, current_user: Dict) -> Dict[str, Any]:
+        """
+        搜索指定组的邮件
+        """
+        # 1. 权限检查
+        if current_user["role"] != "admin":
+            if not self._has_group_permission(group_id, current_user["id"]):
+                return {
+                    "items": [], "total": 0, "page": search.page, "size": search.size, "pages": 0
+                }
 
-                commit_tx(db)
-                return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"Failed to delete attachment {attach_id}: {str(e)}")
-            return False
+        # 2. 执行搜索
+        base_conditions = ["group_id = ?"]
+        base_params = [group_id]
+        return self._execute_mail_search(base_conditions, base_params, search)
 
-    def list_account_mails(self, account_id: int, q: Optional[str] = None,
-                          folder: Optional[str] = None, page: int = 1, size: int = 50) -> Dict:
-        """列出账号邮件"""
-        params = {
-            "search": q,
-            "folder_id": folder
-        }
-        return self.list_messages(account_id, params)
+    def search_all_mails(
+            self, search: MailSearchRequest, current_user: Dict, project_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        全量搜索邮件 (带项目维度和权限控制)
 
-    def search_mails(self, req: MailSearchRequest) -> Dict:
-        """批量搜索邮件"""
-        # 临时实现 - 假设只搜索单个账号
-        if req.account_ids:
-            account_id = req.account_ids[0]  # 简化处理
-            return self.search_messages(account_id, req)
+        逻辑矩阵:
+        1. 管理员 + 指定项目: 搜索该项目分配出去的所有账号的邮件 (不限用户)
+        2. 管理员 + 无项目  : 搜索全库邮件
+        3. 普通用户 + 指定项目: 搜索分配给该用户的、且属于该项目的账号的邮件
+        4. 普通用户 + 无项目  : 搜索分配给该用户的所有账号的邮件
+        """
+        base_conditions = []
+        base_params = []
+
+        if current_user["role"] == "admin":
+            if project_id:
+                # 1. 管理员 + 指定项目 -> 该项目下的所有账号 (通过 project_assignments 关联)
+                base_conditions.append("""
+                    account_id IN (
+                        SELECT account_id 
+                        FROM project_assignments 
+                        WHERE project_id = ?
+                    )
+                """)
+                base_params.append(project_id)
+            else:
+                # 2. 管理员 + 无项目 -> 全量搜索 (无额外 WHERE 条件)
+                pass
         else:
-            # 如果没有指定账号，返回空结果
-            return {
-                "items": [],
-                "total": 0,
-                "page": req.page or 1,
-                "size": req.size or 50,
-                "pages": 0
-            }
+            # 普通用户
+            if project_id:
+                # 3. 普通用户 + 指定项目 -> 自己在该项目下的账号
+                base_conditions.append("""
+                    account_id IN (
+                        SELECT account_id 
+                        FROM project_assignments 
+                        WHERE user_id = ? AND project_id = ?
+                    )
+                """)
+                base_params.extend([current_user["id"], project_id])
+            else:
+                # 4. 普通用户 + 无项目 -> 自己所有的账号
+                base_conditions.append("""
+                    account_id IN (
+                        SELECT account_id 
+                        FROM project_assignments 
+                        WHERE user_id = ?
+                    )
+                """)
+                base_params.append(current_user["id"])
 
-    def batch_create_messages_optimized(self, batch_data: MailMessageBatchCreate) -> Dict:
-        """优化版本的批量创建邮件"""
-        # 简化实现，直接调用普通版本
-        return self.batch_create_messages(batch_data.mails)
+        return self._execute_mail_search(base_conditions, base_params, search)
 
-    def update_message(self, message_id: int, body: MailMessageUpdate) -> Dict:
-        """更新邮件消息"""
-        # 需要先获取account_id
+    def _execute_mail_search(
+            self, conditions: List[str], params: List[Any], search: MailSearchRequest
+    ) -> Dict[str, Any]:
+        """
+        内部通用搜索执行器
+        """
+        # 1. 动态构建搜索条件
+        if search.query:
+            term = f"%{search.query}%"
+            conditions.append("(subject LIKE ? OR from_addr LIKE ? OR to_joined LIKE ?)")
+            params.extend([term, term, term])
+
+        if getattr(search, 'subject', None):
+            conditions.append("subject LIKE ?")
+            params.append(f"%{search.subject}%")
+
+        if getattr(search, 'from_addr', None):
+            conditions.append("from_addr LIKE ?")
+            params.append(f"%{search.from_addr}%")
+
+        if getattr(search, 'to_addr', None):
+            conditions.append("to_joined LIKE ?")
+            params.append(f"%{search.to_addr}%")
+
+        if search.folder_id:
+            conditions.append("folder_id = ?")
+            params.append(search.folder_id)
+
+        if search.has_attachments is not None:
+            op = ">" if search.has_attachments else "="
+            conditions.append(f"attachments_count {op} 0")
+
+        if search.is_unread is not None:
+            if search.is_unread:
+                conditions.append("flags NOT LIKE '%Read%'")
+            else:
+                conditions.append("flags LIKE '%Read%'")
+
+        if search.date_from:
+            conditions.append("received_at >= ?")
+            params.append(search.date_from)
+
+        if search.date_to:
+            conditions.append("received_at <= ?")
+            params.append(search.date_to)
+
+        # 2. 组合 SQL
+        where_clause = ""
+        if conditions:
+            where_clause = " WHERE " + " AND ".join(conditions)
+
+        # 3. 计算总数
+        count_query = f"SELECT COUNT(*) FROM mail_message {where_clause}"
+        total = self.fetch_value(count_query, tuple(params)) or 0
+
+        # 4. 执行查询
+        select_fields = """
+            id, group_id, account_id, subject, from_addr, from_name, 
+            to_joined, folder_id, sent_at, received_at, size_bytes, 
+            attachments_count, flags, snippet
+        """
+
+        page = search.page or 1
+        size = search.size or 50
+        offset = (page - 1) * size
+
+        list_query = f"""
+            SELECT {select_fields} 
+            FROM mail_message 
+            {where_clause} 
+            ORDER BY received_at DESC 
+            LIMIT ? OFFSET ?
+        """
+
+        full_params = params + [size, offset]
+        items = self.fetch_all(list_query, tuple(full_params))
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "size": size,
+            "pages": (total + size - 1) // size
+        }
+
+    def download_mail(self,message_id: int):
+        # 获取邮件基本信息
         with get_db() as db:
             mail = db.execute(
-                "SELECT account_id FROM mail_message WHERE id = ?",
-                (message_id,)
+                "SELECT account_id, msg_uid FROM mail_message WHERE id=?", (message_id,)
             ).fetchone()
 
             if not mail:
                 raise HTTPException(404, "邮件不存在")
 
-        # 调用内部方法
-        success = self._update_message_internal(mail["account_id"], message_id, body)
+            account_id = mail["account_id"]
+            msg_uid = mail["msg_uid"]
 
-        if not success:
-            raise HTTPException(500, "更新失败")
+            if not msg_uid:
+                raise HTTPException(400, "邮件ID无效，无法从Graph API获取")
 
-        return {"success": True}
-
-    def delete_message(self, message_id: int) -> Dict:
-        """删除邮件消息"""
-        # 需要先获取account_id
-        with get_db() as db:
-            mail = db.execute(
-                "SELECT account_id FROM mail_message WHERE id = ?",
-                (message_id,)
+            # 获取账号的group_id
+            account = db.execute(
+                "SELECT group_id FROM accounts WHERE id=?", (account_id,)
             ).fetchone()
 
-            if not mail:
-                raise HTTPException(404, "邮件不存在")
+            if not account:
+                raise HTTPException(404, "账号不存在")
 
-        # 调用内部方法
-        success = self._delete_message_internal(mail["account_id"], message_id)
+            group_id = account["group_id"]
 
-        if not success:
-            raise HTTPException(500, "删除失败")
+            # 获取账号的token缓存（使用group_id）
+            token_cache_row = db.execute(
+                "SELECT uuid FROM account_token_cache WHERE group_id=? LIMIT 1",
+                (group_id,)
+            ).fetchone()
 
-        return {"success": True}
-
-    def _update_message_internal(self, account_id: int, message_id: int, data: MailMessageUpdate) -> bool:
-        """内部更新邮件方法"""
-        update_fields = []
-        update_values = []
-
-        if data.flags is not None:
-            update_fields.append("flags = ?")
-            update_values.append(";".join(data.flags))
-
-        if data.folder_id is not None:
-            update_fields.append("folder_id = ?")
-            update_values.append(data.folder_id)
-
-        if not update_fields:
-            return False
-
-        update_values.extend([account_id, message_id])
+            if not token_cache_row:
+                raise HTTPException(400, "账号未登录或token已过期")
 
         try:
+            # 创建MSAL客户端
+            msal_client = MSALClient(
+                client_id=settings.MSAL_CLIENT_ID,
+                authority=settings.MSAL_AUTHORITY,
+                scopes=settings.MSAL_SCOPES,
+                token_uuid=token_cache_row["uuid"]
+            )
+
+            # 检查token是否有效
+            token = msal_client.get_access_token()
+            if not token:
+                raise HTTPException(400, "账号未登录或token已过期")
+
+            # 从Graph API获取完整邮件
+            mail_data = msal_client._graph_request(
+                "GET",
+                f"me/messages/{msg_uid}",
+                params={"$select": "*"}
+            )
+            # 提取邮件数据
+            headers = mail_data.get("internetMessageHeaders", [])
+            headers_str = "\n".join([f"{h.get('name', '')}: {h.get('value', '')}" for h in headers])
+
+            body_html = mail_data.get("body", {}).get("content", "")
+            body_plain = ""  # 如果需要纯文本，可以从MIME内容解析
+
+            # 更新邮件正文表
             with get_db() as db:
                 begin_tx(db)
                 db.execute(
-                    f"UPDATE mail_message SET {', '.join(update_fields)} WHERE account_id = ? AND id = ?",
-                    tuple(update_values)
+                    """
+                    INSERT OR REPLACE INTO mail_body (message_id, headers, body_plain, body_html)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (message_id, headers_str, body_plain, body_html)
                 )
                 commit_tx(db)
-                return True
-        except Exception as e:
-            logger.error(f"Failed to update message {message_id}: {str(e)}")
-            return False
+            return {
+                "success": True,
+                "message": "邮件内容下载成功",
+                "mail_data": {
+                    "id": message_id,
+                    "subject": mail_data.get("subject", ""),
+                    "from": mail_data.get("from", {}),
+                    "toRecipients": mail_data.get("toRecipients", []),
+                    "ccRecipients": mail_data.get("ccRecipients", []),
+                    "receivedDateTime": mail_data.get("receivedDateTime"),
+                    "body_html": body_html,
+                    "body_plain": body_plain,
+                    "attachments": mail_data.get("attachments", [])
+                }
+            }
 
-    def _delete_message_internal(self, account_id: int, message_id: int) -> bool:
-        """内部删除邮件方法"""
-        try:
-            with get_db() as db:
-                begin_tx(db)
-                cursor = db.execute(
-                    "DELETE FROM mail_message WHERE account_id = ? AND id = ?",
-                    (account_id, message_id)
-                )
-                commit_tx(db)
-                return cursor.rowcount > 0
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Failed to delete message {message_id}: {str(e)}")
-            return False
+            traceback.print_exc()
+            raise HTTPException(500, f"下载邮件内容失败: {str(e)}")
+
+    def batch_download_content(self, message_ids: List[int], max_workers: int = 10) -> Dict[str, Any]:
+        """
+        [高性能优化版] 批量下载邮件内容 + 附件元数据
+        策略:
+        1. 智能过滤: 自动跳过已下载邮件
+        2. 按组预取 Token
+        3. 携带 Token 多线程并发下载 (只拿元数据，不下载附件实体)
+        4. 批量事务写入 Body 和 Attachment
+        """
+        if not message_ids:
+            return {"success": True, "total": 0, "downloaded": 0, "skipped": 0, "errors": []}
+
+
+        # --- 1. 准备元数据 & 智能过滤 ---
+        tasks_metadata = []
+        placeholders = ",".join(["?"] * len(message_ids))
+
+        with get_db() as db:
+            # 联查: 邮件ID -> msg_uid -> token_uuid
+            query = f"""
+                SELECT 
+                    m.id as message_id, 
+                    m.msg_uid, 
+                    c.uuid as token_uuid
+                FROM mail_message m
+                JOIN accounts a ON m.account_id = a.id
+                JOIN account_token_cache c ON a.group_id = c.group_id
+                LEFT JOIN mail_body b ON m.id = b.message_id
+                WHERE m.id IN ({placeholders})
+                  AND b.message_id IS NULL
+            """
+            rows = db.execute(query, message_ids).fetchall()
+            tasks_metadata = [dict(row) for row in rows]
+
+        total_requested = len(message_ids)
+        to_download_count = len(tasks_metadata)
+        skipped_count = total_requested - to_download_count
+
+        if not tasks_metadata:
+            return {
+                "success": True,
+                "total_requested": total_requested,
+                "downloaded": 0,
+                "skipped": skipped_count,
+                "message": "所有选中的邮件均已下载",
+                "errors": []
+            }
+
+        # --- 2. 预取 Token ---
+        unique_token_uuids = set(t["token_uuid"] for t in tasks_metadata)
+        valid_tokens = {}
+        auth_errors = []
+
+        for uuid in unique_token_uuids:
+            try:
+                msal_client = MSALClient(
+                    client_id=settings.MSAL_CLIENT_ID,
+                    authority=settings.MSAL_AUTHORITY,
+                    scopes=settings.MSAL_SCOPES,
+                    token_uuid=uuid
+                )
+                token = msal_client.get_access_token()
+                if token:
+                    valid_tokens[uuid] = token
+                else:
+                    auth_errors.append(uuid)
+            except Exception as e:
+                logger.error(f"Token fetch failed for {uuid}: {e}")
+                auth_errors.append(uuid)
+
+        # --- 3. 定义轻量级下载任务 (包含附件元数据) ---
+        def _lightweight_download(meta, access_token):
+            try:
+                url = f"https://graph.microsoft.com/v1.0/me/messages/{meta['msg_uid']}"
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
+                params = {"$select": "internetMessageHeaders,body,subject"}
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                if resp.status_code != 200:
+                    return {"error": f"Msg {meta['message_id']} HTTP {resp.status_code}"}
+                data = resp.json()
+                # 解析正文
+                headers_list = data.get("internetMessageHeaders", [])
+                headers_str = "\n".join([f"{h.get('name', '')}: {h.get('value', '')}" for h in headers_list])
+                body_html = data.get("body", {}).get("content", "")
+
+                return {
+                    "message_id": meta["message_id"],
+                    "headers": headers_str,
+                    "body_html": body_html,
+                    "body_plain": "",
+                }
+            except Exception as e:
+                return {"error": f"Msg {meta['message_id']} Exception: {str(e)}"}
+
+        # --- 4. 并发执行 ---
+        success_results = []
+        download_errors = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for meta in tasks_metadata:
+                uuid = meta["token_uuid"]
+                if uuid in valid_tokens:
+                    token = valid_tokens[uuid]
+                    futures.append(executor.submit(_lightweight_download, meta, token))
+                else:
+                    download_errors.append(f"Msg {meta['message_id']}: Auth Failed")
+
+            for future in as_completed(futures):
+                res = future.result()
+                if "error" in res:
+                    download_errors.append(res["error"])
+                else:
+                    success_results.append(res)
+
+        # --- 5. 批量写入 DB (Body + Attachments) ---
+        if success_results:
+            try:
+                with get_db() as db:
+                    begin_tx(db)
+                    sql_body = """
+                        INSERT OR REPLACE INTO mail_body (message_id, headers, body_plain, body_html)
+                        VALUES (?, ?, ?, ?)
+                    """
+                    data_body = [
+                        (item["message_id"], item["headers"], item["body_plain"], item["body_html"])
+                        for item in success_results
+                    ]
+                    db.executemany(sql_body, data_body)
+                    commit_tx(db)
+            except Exception as e:
+                logger.error(f"Batch save failed: {e}")
+                return {"success": False, "message": f"Save failed: {str(e)}"}
+
+        return {
+            "success": True,
+            "total_requested": total_requested,
+            "skipped": skipped_count,
+            "downloaded": len(success_results),
+            "errors": download_errors
+        }
