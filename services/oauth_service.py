@@ -1,163 +1,66 @@
-"""优化后的邮箱认证服务层 - 重构版，基于 group_id"""
+"""OAuth 服务层 - 分离版"""
 
-from typing import Dict, List, Optional, Any
-
-from .token_service import TokenService
-from .tasks.login_task_manager import LoginTaskManager
-from .tasks.mail_sync_task_manager import MailSyncTaskManager
+from services.tasks.worker import login_group_task, sync_group_task, _get_cached_token_uuid
+from services.tasks.utils import update_task_status, get_task_status_raw, get_active_statuses_by_type
 from utils.logger import get_logger
-from database.factory import get_db
+from celery_app import celery_app
 
 logger = get_logger(__name__)
 
-
 class OAuthService:
-    """优化后的邮箱认证服务 - 重构版，基于 group_id
 
-    通过组合不同的任务管理器来处理登录和邮件同步任务，
-    基于 group_id 避免重复任务。
-    """
+    # ==================== 登录相关 ====================
 
-    def __init__(self):
-        """初始化认证服务"""
-        self.token_service = TokenService()
-        self.login_manager = LoginTaskManager()
-        self.mail_sync_manager = MailSyncTaskManager()
+    def submit_group_login(self, group_id: str, user_id: int, role: str, force_relogin: bool = False) -> bool:
+        task_type = "login"
 
-    # ==================== 登录任务相关 ====================
+        # 1. 去重 (只检查 login 类型的任务)
+        current = get_task_status_raw(user_id, group_id, task_type)
+        if current and current["status"] in ["PENDING", "RUNNING"]:
+            return True
 
-    def submit_group_login(
-        self,
-        group_id: str,
-        progress_callback: Optional[callable] = None,
-        auto_sync: bool = True
-    ) -> str:
-        """提交邮箱组登录任务
+        # 2. 业务兜底 (Token有效则直接Success)
+        if not force_relogin:
+            token_uuid = _get_cached_token_uuid(group_id)
+            if token_uuid:
+                update_task_status(user_id, group_id, task_type, "SUCCESS", "已登录(缓存有效)", ttl=60)
+                return True
 
-        Args:
-            group_id: 邮箱组ID
-            progress_callback: 进度回调函数
-            auto_sync: 登录成功后是否自动同步邮件
-
-        Returns:
-            task_id: 任务ID
-        """
-        logger.info(f"Submitting login task for group {group_id}")
-        return self.login_manager.submit_group_login(
-            group_id=group_id,
-            progress_callback=progress_callback,
-            auto_sync=auto_sync
+        # 3. 提交
+        update_task_status(user_id, group_id, task_type, "PENDING", "排队中...", ttl=3600)
+        login_group_task.delay(
+            group_id=group_id, user_id=user_id, role=role, force_relogin=force_relogin
         )
+        return True
 
-    def get_login_task_status(self, task_id: str) -> Optional[Dict]:
-        """获取登录任务状态"""
-        return self.login_manager.get_task_status(task_id)
+    def get_my_login_tasks(self, user_id: int):
+        """获取我的登录任务状态"""
+        return get_active_statuses_by_type(user_id, "login")
 
-    def cancel_login(self, group_id: str) -> bool:
-        """取消邮箱组登录任务"""
-        cancelled = self.login_manager.cancel_group_login(group_id)
-        logger.info(f"Cancelled login task for group {group_id}: {cancelled}")
-        return cancelled
+    # ==================== 同步相关 ====================
 
-    # ==================== 邮件同步任务相关 ====================
+    def submit_sync(self, group_id: str, user_id: int, role: str, strategy: str = "auto") -> bool:
+        task_type = "sync"
 
-    def submit_sync(
-        self,
-        group_id: str,
-        strategy: str = "auto",
-        progress_callback: Optional[callable] = None
-    ) -> str:
-        """提交邮箱组邮件同步任务
+        # 1. 去重 (只检查 sync 类型的任务)
+        current = get_task_status_raw(user_id, group_id, task_type)
+        if current and current["status"] in ["PENDING", "RUNNING"]:
+            return True
 
-        Args:
-            group_id: 邮箱组ID
-            strategy: 同步策略
-            progress_callback: 进度回调函数
-
-        Returns:
-            task_id: 任务ID
-        """
-        logger.info(f"Submitting sync task for group {group_id}")
-        return self.mail_sync_manager.submit_group_sync(
-            group_id=group_id,
-            strategy=strategy,
-            progress_callback=progress_callback
+        # 2. 提交
+        update_task_status(user_id, group_id, task_type, "PENDING", "排队中...", ttl=3600)
+        sync_group_task.delay(
+            group_id=group_id, user_id=user_id, role=role, strategy=strategy
         )
+        return True
 
+    def get_my_sync_tasks(self, user_id: int):
+        """获取我的同步任务状态"""
+        return get_active_statuses_by_type(user_id, "sync")
 
-    def get_sync_task_status(self, task_id: str) -> Optional[Dict]:
-        """获取同步任务状态"""
-        return self.mail_sync_manager.get_task_status(task_id)
+    # ==================== 取消相关 ====================
 
-    def cancel_group_sync(self, group_id: str) -> bool:
-        """取消邮箱组同步任务"""
-        cancelled = self.mail_sync_manager.cancel_group_sync(group_id)
-        logger.info(f"Cancelled sync task for group {group_id}: {cancelled}")
-        return cancelled
-
-    # ==================== 批量操作 ====================
-
-    def sync_selected_accounts(
-        self,
-        account_ids: List[int],
-        strategy: str = "auto",
-        progress_callback: Optional[callable] = None
-    ) -> Dict[str, Any]:
-        """同步选中的账号
-
-        Args:
-            account_ids: 账号ID列表
-            strategy: 同步策略
-            progress_callback: 进度回调函数
-
-        Returns:
-            操作结果
-        """
-        if not account_ids:
-            return {"success": False, "error": "没有选择账号"}
-
-        # 提交登录任务
-        login_tasks = self.submit_group_login_by_account_ids(
-            account_ids=account_ids,
-            progress_callback=progress_callback,
-            auto_sync=False  # 手动控制同步
-        )
-
-        # 提交同步任务
-        sync_tasks = self.submit_group_sync_by_account_ids(
-            account_ids=account_ids,
-            strategy=strategy,
-            progress_callback=progress_callback
-        )
-
-        return {
-            "success": True,
-            "login_tasks": login_tasks,
-            "sync_tasks": sync_tasks,
-            "total_groups": len(login_tasks)
-        }
-
-    def sync_all_accounts(
-        self,
-        strategy: str = "auto",
-        progress_callback: Optional[callable] = None
-    ) -> Dict[str, Any]:
-        """同步所有账号
-
-        Args:
-            strategy: 同步策略
-            progress_callback: 进度回调函数
-
-        Returns:
-            操作结果
-        """
-        # 获取所有账号
-        with get_db() as db:
-            accounts = db.execute("SELECT id FROM accounts").fetchall()
-            account_ids = [row["id"] for row in accounts]
-
-        return self.sync_selected_accounts(
-            account_ids=account_ids,
-            strategy=strategy,
-            progress_callback=progress_callback
-        )
+    def cancel_task_by_type(self, group_id: str, user_id: int, task_type: str):
+        # 简单标记为失败，停止前端轮询
+        update_task_status(user_id, group_id, task_type, "FAILURE", "已手动取消", ttl=60)
+        return True

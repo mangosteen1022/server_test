@@ -1,167 +1,98 @@
-"""邮箱认证 API 路由 - 基于group_id的重构版本"""
+"""邮箱认证 API 路由 - 分离版"""
 
-from typing import Optional, List, Dict, Any
-
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
-from models.oauth import *
-
+from typing import Dict, Any
+from fastapi import APIRouter, Depends
+from models.oauth import GroupLoginRequest, GroupSyncRequest
 from services.oauth_service import OAuthService
+from routes.auth import get_current_user
 
 router = APIRouter()
 
+# --- 提交接口 ---
 
-# ==================== 登录相关路由 ====================
-
-@router.post("/auth/login/groups", response_model=Dict[str, Any])
+@router.post("/auth/login/groups")
 async def submit_group_login(
     request: GroupLoginRequest,
+    current_user: dict = Depends(get_current_user)
 ):
-    """
-    提交邮箱组登录任务
-
-    - 基于group_id避免重复任务
-    - 任务在后台异步执行
-    - 返回每个组的任务ID
-    """
     service = OAuthService()
-
-    task_ids = {}
+    count = 0
     for group_id in request.group_ids:
-        task_id = service.submit_group_login(
+        if service.submit_group_login(
             group_id=group_id,
-            auto_sync=request.auto_sync
-        )
-        task_ids[group_id] = task_id
+            user_id=current_user["id"],
+            role=current_user["role"],
+            force_relogin=request.force_relogin
+        ):
+            count += 1
+    return {"success": True, "submitted_count": count, "message": "登录任务已提交"}
 
-    return {
-        "success": True,
-        "task_ids": task_ids,
-        "total_groups": len(task_ids),
-        "message": f"已提交 {len(task_ids)} 个组的登录任务"
-    }
-
-
-@router.get("/auth/login/status/{task_id}", response_model=Dict[str, Any])
-async def get_login_task_status(
-    task_id: str,
+@router.post("/auth/sync/groups")
+async def submit_group_sync(
+    request: GroupSyncRequest,
+    current_user: dict = Depends(get_current_user)
 ):
-    """获取登录任务状态"""
     service = OAuthService()
-    status = service.get_login_task_status(task_id)
+    count = 0
+    for group_id in request.group_ids:
+        if service.submit_sync(
+            group_id=group_id,
+            user_id=current_user["id"],
+            role=current_user["role"],
+            strategy=request.strategy
+        ):
+            count += 1
+    return {"success": True, "submitted_count": count, "message": "同步任务已提交"}
 
-    if not status:
-        raise HTTPException(404, "任务不存在或已过期")
+# --- 看板接口 (分离) ---
 
-    return status
+@router.get("/auth/login/status/list")
+async def get_login_tasks_status(current_user: dict = Depends(get_current_user)):
+    """获取所有活跃的登录任务"""
+    service = OAuthService()
+    statuses = service.get_my_login_tasks(current_user["id"])
+    return {"success": True, "tasks": statuses, "count": len(statuses)}
+
+@router.get("/auth/sync/status/list")
+async def get_sync_tasks_status(current_user: dict = Depends(get_current_user)):
+    """获取所有活跃的同步任务"""
+    service = OAuthService()
+    statuses = service.get_my_sync_tasks(current_user["id"])
+    return {"success": True, "tasks": statuses, "count": len(statuses)}
 
 
 @router.delete("/auth/login/groups/{group_id}")
 async def cancel_group_login(
     group_id: str,
-):
-    """取消邮箱组登录任务"""
-    service = OAuthService()
-
-    cancelled = service.cancel_group_login(group_id)
-
-    return {
-        "success": True,
-        "cancelled": cancelled,
-        "message": f"组 {group_id} 的登录任务{'已取消' if cancelled else '不存在或无法取消'}"
-    }
-
-
-# ==================== 邮件同步相关路由 ====================
-
-@router.post("/auth/sync/groups", response_model=Dict[str, Any])
-async def submit_group_sync(
-    request: GroupSyncRequest,
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    提交邮箱组邮件同步任务
-
-    - 基于group_id避免重复任务
-    - 任务在后台异步执行
-    - 返回每个组的任务ID
+    取消单个登录任务
+    前端逻辑: 用户点击登录任务列表中的"取消"按钮时调用
     """
     service = OAuthService()
-
-    task_ids = {}
-    for group_id in request.group_ids:
-        task_id = service.submit_group_sync(
-            group_id=group_id,
-            strategy=request.strategy
-        )
-        task_ids[group_id] = task_id
-
-    return {
-        "success": True,
-        "task_ids": task_ids,
-        "total_groups": len(task_ids),
-        "message": f"已提交 {len(task_ids)} 个组的邮件同步任务"
-    }
-
-
-@router.get("/auth/sync/status/{task_id}", response_model=Dict[str, Any])
-async def get_sync_task_status(
-    task_id: str,
-):
-    """获取同步任务状态"""
-    service = OAuthService()
-    status = service.get_sync_task_status(task_id)
-
-    if not status:
-        raise HTTPException(404, "任务不存在或已过期")
-
-    return status
-
+    # 明确指定 task_type="login"
+    cancelled = service.cancel_task_by_type(
+        group_id=group_id,
+        user_id=current_user["id"],
+        task_type="login"
+    )
+    return {"success": True, "cancelled": cancelled, "message": "登录任务已取消"}
 
 @router.delete("/auth/sync/groups/{group_id}")
 async def cancel_group_sync(
     group_id: str,
-):
-    """取消邮箱组同步任务"""
-    service = OAuthService()
-
-    cancelled = service.cancel_group_sync(group_id)
-
-    return {
-        "success": True,
-        "cancelled": cancelled,
-        "message": f"组 {group_id} 的同步任务{'已取消' if cancelled else '不存在或无法取消'}"
-    }
-
-
-# ==================== 批量操作路由 ====================
-
-@router.post("/auth/sync/selected-accounts", response_model=Dict[str, Any])
-async def sync_selected_accounts(
-    request: AccountIdsSyncRequest,
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    同步选中的账号（登录+同步）
-
-    - 先提交登录任务
-    - 登录成功后自动提交同步任务
-    - 返回所有任务的ID
+    取消单个同步任务
+    前端逻辑: 用户点击同步任务列表中的"取消"按钮时调用
     """
     service = OAuthService()
-
-    result = service.sync_selected_accounts(
-        account_ids=request.account_ids,
-        strategy=request.strategy
+    # 明确指定 task_type="sync"
+    cancelled = service.cancel_task_by_type(
+        group_id=group_id,
+        user_id=current_user["id"],
+        task_type="sync"
     )
-
-    return result
-
-
-@router.post("/auth/sync/all-accounts", response_model=Dict[str, Any])
-async def sync_all_accounts(
-    strategy: str = "auto",
-):
-    """同步所有账号"""
-    service = OAuthService()
-
-    result = service.sync_all_accounts(strategy=strategy)
-
-    return result
+    return {"success": True, "cancelled": cancelled, "message": "同步任务已取消"}

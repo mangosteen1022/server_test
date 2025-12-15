@@ -64,6 +64,8 @@ class MailSyncManager:
         try:
             # 1. 获取同步状态
             sync_state = self.get_sync_state(group_id)
+            if strategy == "check":
+                return self.sync_check(group_id, msal_client, progress_callback)
 
             if progress_callback:
                 progress_callback(group_id, f"开始同步邮件 (策略: {strategy})")
@@ -95,6 +97,34 @@ class MailSyncManager:
         except Exception as e:
             traceback.print_exc()
             return {"success": False, "error": str(e), "synced": 0}
+
+    def sync_check(
+            self,
+            group_id: str,
+            msal_client: MSALClient,
+            progress_callback: Optional[Callable[[str, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        [保活策略] 仅请求用户信息，确认 Token 有效性
+        """
+        if progress_callback:
+            progress_callback(group_id, "正在执行保活检查...")
+
+        try:
+            # 调用轻量级接口
+            me = msal_client.get_me()
+            if me and "id" in me:
+                # 记录最后交互时间（可选，视数据库结构而定）
+                # update_last_interaction(group_id)
+                return {
+                    "success": True,
+                    "synced": 0,
+                    "message": "保活检查成功: Token有效"
+                }
+            else:
+                return {"success": False, "error": "无法获取用户信息"}
+        except Exception as e:
+            return {"success": False, "error": f"保活检查失败: {str(e)}"}
 
     def _sync_folders_to_db(self, group_id: str, msal_client: MSALClient) -> int:
         """同步文件夹到数据库"""

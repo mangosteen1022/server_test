@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS mail_message (
   received_at        TEXT,
   size_bytes         INTEGER,
   attachments_count  INTEGER NOT NULL DEFAULT 0,
-  flags              INTEGER NOT NULL DEFAULT 0,
+  flags              TEXT NOT NULL DEFAULT 'UNREAD',
   snippet            TEXT,
 
   created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc')),

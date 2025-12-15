@@ -25,15 +25,6 @@ class GroupSyncRequest(BaseModel):
     end_date: Optional[str] = None
 
 
-class AccountIdsSyncRequest(BaseModel):
-    """账号ID邮件同步请求"""
-    account_ids: List[int]  # account_id列表（会自动按group_id分组）
-    strategy: str = "auto"
-    days: Optional[int] = 30
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-
-
 class TaskStatusResponse(BaseModel):
     """任务状态响应"""
     task_id: str

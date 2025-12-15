@@ -44,3 +44,7 @@ DB_TIMEOUT = int(os.environ.get("DB_TIMEOUT", 30))
 SECRET_KEY = "mangosteen-system-secret-key-change-me"  # 请务必修改
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # token有效期：24小时
+
+# REDIS 配置
+REDIS_URL = "redis://localhost:6379/0"
+REDIS_AUTH = "password"
