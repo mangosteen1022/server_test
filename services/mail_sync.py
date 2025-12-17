@@ -13,6 +13,77 @@ from database.factory import get_db
 class MailSyncManager:
     """邮件同步管理器"""
 
+    def sync_only_folders(
+            self,
+            group_id: str,
+            msal_client: MSALClient
+    ) -> Dict[str, Any]:
+        """
+        [独立功能] 同步完整文件夹目录树 (不含隐藏文件夹，含子文件夹)
+        """
+        try:
+            # 1. 获取根目录文件夹
+            # 此时调用的是我们刚改过的 list_mail_folders (不含隐藏)
+            root_resp = msal_client.list_mail_folders(top=100)
+            root_folders = root_resp.get("value", [])
+
+            if not root_folders:
+                return {"success": True, "count": 0, "message": "无文件夹"}
+
+            folder_queue = list(root_folders)
+
+            # 使用索引遍历，因为我们在遍历过程中会往列表末尾追加新元素
+            i = 0
+            while i < len(folder_queue):
+                current_folder = folder_queue[i]
+                i += 1
+
+                # 检查是否有子文件夹
+                child_count = current_folder.get("childFolderCount", 0)
+                f_id = current_folder.get("id")
+
+                if child_count > 0 and f_id:
+                    try:
+                        # 获取子文件夹并追加到队列末尾
+                        child_resp = msal_client.list_child_folders(f_id, top=100)
+                        children = child_resp.get("value", [])
+                        if children:
+                            folder_queue.extend(children)
+                    except Exception as e:
+                        print(f"获取子文件夹失败 {f_id}: {e}")
+
+            # 3. 批量写入数据库
+            total_synced = 0
+            with get_db() as db:
+                for folder in folder_queue:
+                    folder_id = folder.get("id")
+                    display_name = folder.get("displayName")
+                    parent_id = folder.get("parentFolderId")
+                    well_known = folder.get("wellKnownName")
+
+                    # 注意：根据最新的 schema.sql，主键是 folder_id
+                    db.execute("""
+                               INSERT INTO mail_folder (id, group_id, display_name, well_known_name,
+                                                        parent_folder_id)
+                               VALUES (?, ?, ?, ?, ?)
+                               ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,
+                                                                    parent_folder_id=excluded.parent_folder_id
+                               """, (folder_id, group_id, display_name, well_known, parent_id))
+                    total_synced += 1
+
+                db.commit()
+
+            return {
+                "success": True,
+                "count": total_synced,
+                "message": f"目录同步完成 (根目录+子目录 共{total_synced}个)"
+            }
+
+        except Exception as e:
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
+
     def sync_group_mails(
         self,
         group_id: str,
@@ -70,9 +141,6 @@ class MailSyncManager:
             if progress_callback:
                 progress_callback(group_id, f"开始同步邮件 (策略: {strategy})")
 
-            # 同步文件夹到数据库
-            self._sync_folders_to_db(group_id, msal_client)
-
             # 2. 根据策略选择同步方式
             if strategy == "auto":
                 if sync_state.get("delta_link"):
@@ -126,38 +194,6 @@ class MailSyncManager:
         except Exception as e:
             return {"success": False, "error": f"保活检查失败: {str(e)}"}
 
-    def _sync_folders_to_db(self, group_id: str, msal_client: MSALClient) -> int:
-        """同步文件夹到数据库"""
-        try:
-            with get_db() as db:
-                response = msal_client.list_mail_folders()
-                folders = response.get("value", [])
-                if not folders:
-                    return 0
-
-                folder_data = []
-                for folder in folders:
-                    try:
-                        folder_id = folder["id"]
-                        folder_name = folder.get("displayName", "Unknown")
-                        parent_id = folder.get("parentFolderId")
-                        folder_data.append((folder_id, group_id, folder_name, parent_id))
-                    except Exception as e:
-                        print(f"准备文件夹数据失败: {e}")
-                        continue
-
-                if folder_data:
-                    db.executemany("""
-                        INSERT OR REPLACE INTO mail_folder (
-                            id, group_id, display_name, parent_folder_id
-                        ) VALUES (?, ?, ?, ?)
-                    """, folder_data)
-                    db.commit()
-
-                return len(folder_data)
-        except Exception as e:
-            print(f"同步文件夹失败: {e}")
-            return 0
 
     def get_sync_state(self, group_id: str) -> Dict[str, Any]:
         """获取同步状态"""
@@ -672,54 +708,54 @@ class MailSyncManager:
             except Exception as e:
                 print(f"准备邮件数据失败: {e}")
                 continue
+        with get_db() as db:
+            try:
+                batch_size = 100
+                account_record = db.execute(
+                    "SELECT id FROM accounts WHERE group_id = ? LIMIT 1",
+                    (group_id,)
+                ).fetchone()
+                account_id = account_record["id"] if account_record else None
 
-        try:
-            batch_size = 100
-            account_record = db.execute(
-                "SELECT id FROM accounts WHERE group_id = ? LIMIT 1",
-                (group_id,)
-            ).fetchone()
-            account_id = account_record["id"] if account_record else None
+                for i in range(0, len(mail_data_list), batch_size):
+                    batch = mail_data_list[i:i+batch_size]
 
-            for i in range(0, len(mail_data_list), batch_size):
-                batch = mail_data_list[i:i+batch_size]
+                    mail_values = []
+                    for mail_data in batch:
+                        mail_values.append((
+                            mail_data["group_id"],
+                            account_id,
+                            mail_data["msg_uid"],
+                            mail_data["msg_id"],
+                            mail_data["subject"],
+                            mail_data["from_addr"],
+                            mail_data["from_name"],
+                            ",".join(mail_data["to"]) if mail_data["to"] else "",
+                            mail_data["folder_id"],
+                            mail_data["sent_at"],
+                            mail_data["received_at"],
+                            mail_data["snippet"],
+                            mail_data["flags"],
+                            mail_data["has_attachments"],
+                            utc_now()
+                        ))
 
-                mail_values = []
-                for mail_data in batch:
-                    mail_values.append((
-                        mail_data["group_id"],
-                        account_id,
-                        mail_data["msg_uid"],
-                        mail_data["msg_id"],
-                        mail_data["subject"],
-                        mail_data["from_addr"],
-                        mail_data["from_name"],
-                        ",".join(mail_data["to"]) if mail_data["to"] else "",
-                        mail_data["folder_id"],
-                        mail_data["sent_at"],
-                        mail_data["received_at"],
-                        mail_data["snippet"],
-                        mail_data["flags"],
-                        mail_data["attachments_count"],
-                        utc_now()
-                    ))
+                    cursor = db.cursor()
+                    cursor.executemany("""
+                        INSERT OR IGNORE INTO mail_message (
+                            group_id, account_id, msg_uid, msg_id, subject, from_addr, from_name,
+                            to_joined, folder_id, sent_at, received_at, snippet,
+                            flags, has_attachments, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, mail_values)
 
-                cursor = db.cursor()
-                cursor.executemany("""
-                    INSERT OR IGNORE INTO mail_message (
-                        group_id, account_id, msg_uid, msg_id, subject, from_addr, from_name,
-                        to_joined, folder, sent_at, received_at, snippet,
-                        flags, attachments_count, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, mail_values)
+                    saved_count += cursor.rowcount
+                    db.commit()
 
-                saved_count += cursor.rowcount
-                db.commit()
-
-        except Exception as e:
-            print(f"批量保存邮件失败: {e}")
-            db.rollback()
-            return saved_count
+            except Exception as e:
+                print(f"批量保存邮件失败: {e}")
+                db.rollback()
+                return saved_count
 
         return saved_count
 

@@ -16,7 +16,7 @@ def get_account_folders(
     db: sqlite3.Connection = Depends(get_db),
 ):
     """获取账号的邮件文件夹列表"""
-    r = db.execute("SELECT id FROM account WHERE id=?", (account_id,)).fetchone()
+    r = db.execute("SELECT id FROM accounts WHERE id=?", (account_id,)).fetchone()
     if not r:
         raise HTTPException(404, "account not found")
 

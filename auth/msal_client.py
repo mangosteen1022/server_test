@@ -300,22 +300,22 @@ class MSALClient:
         """获取当前用户信息"""
         return self._graph_request("GET", "me")
 
-    def list_mail_folders(self) -> Dict[str, Any]:
-        """列出用户的所有邮件文件夹"""
-        folder = self._graph_request("GET", "me/mailFolders")
-        return folder
-
-    def list_child_folders(self, folder_id: str) -> Dict[str, Any]:
-        """列出指定文件夹的子文件夹
-
-        Args:
-            folder_id: 父文件夹ID
-
-        Returns:
-            子文件夹列表
+    def list_mail_folders(self, top: int = 100) -> Dict[str, Any]:
         """
+        列出根目录下的邮件文件夹
+        注意：默认不包含隐藏文件夹 (Hidden Folders)，只返回用户可见的
+        """
+        # Graph API 默认每页10条，这里设为100尽量一次拿完
+        params = {"$top": top}
+        return self._graph_request("GET", "me/mailFolders", params=params)
+
+    def list_child_folders(self, folder_id: str, top: int = 100) -> Dict[str, Any]:
+        """
+        列出指定文件夹的子文件夹
+        """
+        params = {"$top": top}
         try:
-            return self._graph_request("GET", f"me/mailFolders/{folder_id}/childFolders")
+            return self._graph_request("GET", f"me/mailFolders/{folder_id}/childFolders", params=params)
         except Exception as e:
             self.logger.error(f"Failed to list child folders for {folder_id}: {e}")
             return {"value": []}

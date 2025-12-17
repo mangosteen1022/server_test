@@ -7,9 +7,9 @@ from celery import shared_task
 from celery.utils.log import get_task_logger
 
 from auth.msal_client import MSALClient
+from services.mail_sync import MailSyncManager
 from services.tasks.async_adapter import AsyncMailSyncManager
 from services.tasks.utils import user_concurrency_guard, update_task_status
-from services.auth_service import AuthService
 from database.factory import get_db, begin_tx, commit_tx
 from utils.logger import get_logger
 
@@ -92,8 +92,6 @@ def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin
     TASK_TYPE = "login"
     update_task_status(user_id, group_id, TASK_TYPE, "RUNNING", "正在登录...", ttl=3600)
     with user_concurrency_guard(self, user_id, role):
-        self.update_state(state='PROGRESS', meta={'message': '准备登录...'})
-
         try:
             # 1. 准备账号数据
             with get_db() as db:
@@ -134,11 +132,19 @@ def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin
             # 3. 处理结果 (直接写库，因为是低频高重要性数据)
             if result.get("success"):
                 update_task_status(user_id, group_id, TASK_TYPE, "SUCCESS", "登录成功", ttl=60)
+                new_token_uuid = _get_cached_token_uuid(group_id)
+                sync_client = _create_msal_client(new_token_uuid)
+                sync_manager = MailSyncManager()
+                folder_res = sync_manager.sync_only_folders(group_id, sync_client)
+                if folder_res["success"]:
+                    msg = f"登录成功 (目录: {folder_res['count']}个)"
+                else:
+                    msg = f"登录成功 (目录同步失败: {folder_res.get('error')})"
+                # TODO 更新的数据保存
                 # 如果自动化脚本修改了密码，这里需要更新数据库
                 # 假设 result 包含 new_password 字段
                 new_password = result.get("new_password")
-
-                if new_password: # TODO
+                if new_password:
                     with get_db() as db:
                         begin_tx(db)
                         # 更新该组所有账号密码
@@ -192,3 +198,28 @@ def maintenance_check_task():
 
     except Exception as e:
         celery_logger.error(f"Maintenance check failed: {e}")
+
+
+# 同步文件夹任务
+@shared_task(bind=True, name="tasks.sync_folders")
+def sync_folders_task(self, group_id: str, user_id: int, role: str):
+    """手动同步文件夹结构"""
+    TASK_TYPE = "sync_folders"  # 使用独立的任务类型，避免混淆
+    update_task_status(user_id, group_id, TASK_TYPE, "RUNNING", "正在更新目录...", ttl=3600)
+
+    with user_concurrency_guard(self, user_id, role):
+        try:
+            token_uuid = _get_cached_token_uuid(group_id)
+            if not token_uuid:
+                update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", "未登录", ttl=60)
+                return
+            client = _create_msal_client(token_uuid)
+            manager = MailSyncManager()
+            res = manager.sync_only_folders(group_id, client)
+            if res["success"]:
+                update_task_status(user_id, group_id, TASK_TYPE, "SUCCESS", f"目录更新完成 ({res['count']}个)", ttl=60)
+            else:
+                update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", f"失败: {res.get('error')}", ttl=60)
+
+        except Exception as e:
+            update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", str(e), ttl=60)

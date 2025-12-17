@@ -127,9 +127,6 @@ CREATE TABLE IF NOT EXISTS mail_message (
   to_joined          TEXT NOT NULL DEFAULT '',
   to_joined_lc       TEXT GENERATED ALWAYS AS (lower(to_joined)) STORED,
 
-  folder             TEXT NOT NULL DEFAULT 'INBOX',
-  folder_lc          TEXT GENERATED ALWAYS AS (lower(folder)) STORED,
-
   folder_id          TEXT,                      -- Graph API文件夹ID
   labels_joined      TEXT NOT NULL DEFAULT '',
   labels_joined_lc   TEXT GENERATED ALWAYS AS (lower(labels_joined)) STORED,
@@ -137,7 +134,7 @@ CREATE TABLE IF NOT EXISTS mail_message (
   sent_at            TEXT,
   received_at        TEXT,
   size_bytes         INTEGER,
-  attachments_count  INTEGER NOT NULL DEFAULT 0,
+  has_attachments  INTEGER NOT NULL DEFAULT 0,
   flags              TEXT NOT NULL DEFAULT 'UNREAD',
   snippet            TEXT,
 

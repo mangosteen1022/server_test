@@ -5,44 +5,48 @@ from fastapi import APIRouter, Depends
 from models.oauth import GroupLoginRequest, GroupSyncRequest
 from services.oauth_service import OAuthService
 from routes.auth import get_current_user
+from services.tasks.utils import update_task_status
 
 router = APIRouter()
+
 
 # --- 提交接口 ---
 
 @router.post("/auth/login/groups")
 async def submit_group_login(
-    request: GroupLoginRequest,
-    current_user: dict = Depends(get_current_user)
+        request: GroupLoginRequest,
+        current_user: dict = Depends(get_current_user)
 ):
     service = OAuthService()
     count = 0
     for group_id in request.group_ids:
         if service.submit_group_login(
-            group_id=group_id,
-            user_id=current_user["id"],
-            role=current_user["role"],
-            force_relogin=request.force_relogin
+                group_id=group_id,
+                user_id=current_user["id"],
+                role=current_user["role"],
+                force_relogin=request.force_relogin
         ):
             count += 1
     return {"success": True, "submitted_count": count, "message": "登录任务已提交"}
 
+
 @router.post("/auth/sync/groups")
 async def submit_group_sync(
-    request: GroupSyncRequest,
-    current_user: dict = Depends(get_current_user)
+        request: GroupSyncRequest,
+        current_user: dict = Depends(get_current_user)
 ):
     service = OAuthService()
     count = 0
     for group_id in request.group_ids:
         if service.submit_sync(
-            group_id=group_id,
-            user_id=current_user["id"],
-            role=current_user["role"],
-            strategy=request.strategy
+                group_id=group_id,
+                user_id=current_user["id"],
+                role=current_user["role"],
+                strategy=request.strategy
         ):
             count += 1
     return {"success": True, "submitted_count": count, "message": "同步任务已提交"}
+
 
 # --- 看板接口 (分离) ---
 
@@ -52,6 +56,7 @@ async def get_login_tasks_status(current_user: dict = Depends(get_current_user))
     service = OAuthService()
     statuses = service.get_my_login_tasks(current_user["id"])
     return {"success": True, "tasks": statuses, "count": len(statuses)}
+
 
 @router.get("/auth/sync/status/list")
 async def get_sync_tasks_status(current_user: dict = Depends(get_current_user)):
@@ -63,8 +68,8 @@ async def get_sync_tasks_status(current_user: dict = Depends(get_current_user)):
 
 @router.delete("/auth/login/groups/{group_id}")
 async def cancel_group_login(
-    group_id: str,
-    current_user: dict = Depends(get_current_user)
+        group_id: str,
+        current_user: dict = Depends(get_current_user)
 ):
     """
     取消单个登录任务
@@ -79,10 +84,11 @@ async def cancel_group_login(
     )
     return {"success": True, "cancelled": cancelled, "message": "登录任务已取消"}
 
+
 @router.delete("/auth/sync/groups/{group_id}")
 async def cancel_group_sync(
-    group_id: str,
-    current_user: dict = Depends(get_current_user)
+        group_id: str,
+        current_user: dict = Depends(get_current_user)
 ):
     """
     取消单个同步任务
@@ -96,3 +102,25 @@ async def cancel_group_sync(
         task_type="sync"
     )
     return {"success": True, "cancelled": cancelled, "message": "同步任务已取消"}
+
+
+@router.post("/auth/sync/folders/{group_id}")
+async def manual_sync_folders(
+        group_id: str,
+        current_user: dict = Depends(get_current_user)
+):
+    """
+    [新增] 手动触发文件夹结构同步
+    用于当用户发现新文件夹未显示时，手动强制更新目录树
+    """
+    user_id = current_user["id"]
+    service = OAuthService()
+    task_id = service.submit_folder_sync(
+        group_id, user_id, current_user["role"]
+    )
+
+    return {
+        "success": True,
+        "message": "目录同步任务已提交",
+        "task_id":task_id
+    }

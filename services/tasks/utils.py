@@ -102,3 +102,17 @@ def user_concurrency_guard(task_instance, user_id: int, role: str):
         yield
     finally:
         sem.release()
+
+def make_status_key(user_id, group_id, task_type):
+    return f"task:{user_id}:{group_id}:{task_type}"
+
+def get_task_status(user_id, group_id, task_type):
+    """从 Redis 获取任务状态详情"""
+    key = make_status_key(user_id, group_id, task_type)
+    data = redis_client.get(key)
+    if data:
+        try:
+            return json.loads(data)
+        except:
+            return None
+    return None
