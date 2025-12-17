@@ -95,29 +95,22 @@ def _flush_buffer(raw_items: List[bytes]):
         start_t = time.time()
         with get_db() as db:
             begin_tx(db)
-
             total_records = 0
-
             for table, rows in grouped_data.items():
                 if not rows:
                     continue
-
-                # 动态构建 SQL (SQLite INSERT OR IGNORE / REPLACE)
-                # 注意：这里假设 rows[0] 的 keys 包含了所有字段
                 keys = list(rows[0].keys())
                 columns = ", ".join(keys)
-                placeholders = ", ".join([f":{k}" for k in keys])
-
-                # 针对不同表可能采取不同策略，这里统一用 REPLACE 或 IGNORE
-                # mail_body通常用 REPLACE, mail_message 用 IGNORE
+                placeholders = ", ".join(["?" for _ in keys])
                 action = "INSERT OR REPLACE" if table == "mail_body" else "INSERT OR IGNORE"
-
                 sql = f"{action} INTO {table} ({columns}) VALUES ({placeholders})"
-
-                # 执行批量插入
-                db.execute(text(sql), rows)
+                values_list = []
+                for row in rows:
+                    values_list.append(tuple(row[k] for k in keys))
+                db.executemany(sql, values_list)
                 total_records += len(rows)
 
+            # E. 提交事务
             commit_tx(db)
 
             duration = time.time() - start_t

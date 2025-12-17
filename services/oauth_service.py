@@ -4,8 +4,7 @@ from typing import List, Dict
 
 from celery_app import celery_app
 from services.tasks.worker import login_group_task, sync_group_task, _get_cached_token_uuid, sync_folders_task
-from services.tasks.utils import update_task_status, get_task_status_raw, get_active_statuses_by_type, redis_client, \
-    get_task_status
+from services.tasks.utils import update_task_status, get_active_statuses_by_type, redis_client, get_task_status
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -19,7 +18,7 @@ class OAuthService:
         task_type = "login"
 
         # 1. 去重 (只检查 login 类型的任务)
-        current = get_task_status_raw(user_id, group_id, task_type)
+        current = get_task_status(user_id, group_id, task_type)
         if current and current["status"] in ["PENDING", "RUNNING"]:
             return True
 
@@ -44,7 +43,7 @@ class OAuthService:
         task_type = "sync"
 
         # 1. 去重 (只检查 sync 类型的任务)
-        current = get_task_status_raw(user_id, group_id, task_type)
+        current = get_task_status(user_id, group_id, task_type)
         if current and current["status"] in ["PENDING", "RUNNING"]:
             return True
 
@@ -61,39 +60,41 @@ class OAuthService:
 
     # ==================== 取消相关 ====================
 
-    def cancel_task_by_type(self, group_id: str, user_id: int, task_type: str):
+    def cancel_all_tasks_by_type(self, user_id: int, task_type: str) -> int:
         """
-                取消指定类型的任务
-                核心逻辑: 查Redis找TaskID -> Celery Revoke -> 更新Redis状态
-                """
-        # 1. 获取当前任务状态
-        status = get_task_status(user_id, group_id, task_type)
-        if not status:
-            return False
+        【修正】批量取消当前用户该类型下的**所有**任务
+        :param user_id: 用户ID
+        :param task_type: 'login' 或 'sync' (含 sync_folders)
+        :return: 成功撤销的任务数量
+        """
+        active_tasks = get_active_statuses_by_type(user_id, task_type)
+        cancelled_count = 0
+        for task_info in active_tasks:
+            celery_task_id = task_info.get("task_id")
+            group_id = task_info.get("group_id")
+            current_state = task_info.get("status")  # 注意：utils里字段叫 status, celery叫 state
 
-        celery_task_id = status.get("task_id")
+            # 只处理未完成的任务
+            if current_state in ["PENDING", "RUNNING"] and celery_task_id:
+                try:
+                    # 强行终止 Worker
+                    celery_app.control.revoke(celery_task_id, terminate=True)
 
-        # 2. 如果任务正在运行或排队，尝试撤销
-        if celery_task_id and status.get("state") in ["PENDING", "RUNNING"]:
-            try:
-                # terminate=True: 强行终止正在执行的 Worker 进程 (SIGTERM)
-                celery_app.control.revoke(celery_task_id, terminate=True)
+                    # 更新 Redis 状态
+                    update_task_status(
+                        user_id,
+                        group_id,
+                        task_type,
+                        "CANCELLED",
+                        "用户批量取消",
+                        ttl=60,
+                        task_id=celery_task_id  # 保持 ID
+                    )
+                    cancelled_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to revoke task {celery_task_id}: {e}")
 
-                # 3. 立即更新 Redis 状态为 Cancelled，给前端反馈
-                update_task_status(
-                    user_id,
-                    group_id,
-                    task_type,
-                    "CANCELLED",
-                    "用户手动取消",
-                    ttl=60
-                )
-                return True
-            except Exception as e:
-                print(f"Failed to revoke task {celery_task_id}: {e}")
-                return False
-
-        return False
+        return cancelled_count
 
     def get_my_login_tasks(self, user_id: int) -> List[Dict]:
         """获取某用户的所有登录任务状态"""

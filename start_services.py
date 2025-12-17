@@ -64,7 +64,7 @@ def main():
         processes.append(p_beat)
 
         # 4. 启动 FastAPI
-        p_api = start_process("uvicorn app:app --host 0.0.0.0 --port 8000 --reload", "FastAPI Server")
+        p_api = start_process("uvicorn main:app --host 0.0.0.0 --port 8000", "FastAPI Server")
         processes.append(p_api)
 
         print("\n✅ System matches configured! (Mode: Threads, Concurrency: 50)")

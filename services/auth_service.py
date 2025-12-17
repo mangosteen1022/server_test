@@ -23,8 +23,6 @@ class AuthService:
                 "SELECT id, name, password, role FROM users WHERE name = ?",
                 (username,)
             ).fetchone()
-
-            # 这里演示用明文，生产环境请使用 bcrypt.verify(password, user['password'])
             if not user or user["password"] != password:
                 return None
 

@@ -3,7 +3,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
-
+from services.tasks.worker import batch_download_task
 from database.factory import get_db
 from models.mail import MailSearchRequest,BatchFlagRequest,BatchDownloadRequest
 from routes.auth import get_current_user
@@ -20,6 +20,35 @@ def _get_group_id_by_message_id(message_id: int) -> str:
             raise HTTPException(404, "Message not found")
         return row["group_id"]
 
+
+@router.get("/groups/{group_id}/messages")
+def list_group_messages(
+        group_id: str,
+        page: int = Query(1, ge=1, description="页码"),
+        size: int = Query(50, ge=1, le=100, description="每页数量"),
+        folder_id: Optional[str] = Query(None, description="文件夹ID过滤"),
+        search: Optional[str] = Query(None, description="搜索关键词"),
+        is_unread: Optional[bool] = Query(None, description="是否只看未读"),
+        has_attachments: Optional[bool] = Query(None, description="是否有附件"),
+        current_user: dict = Depends(get_current_user)
+):
+    """
+    [新增] 获取当前组下的所有邮件 (支持分页、搜索、过滤)
+    实际上是 list_messages / search 的 GET 快捷方式
+    """
+    service = MailService()
+
+    # 构造参数字典，直接复用 Service 层逻辑
+    params = {
+        "page": page,
+        "size": size,
+        "folder_id": folder_id,
+        "search": search,
+        "is_unread": is_unread,
+        "has_attachments": has_attachments
+    }
+
+    return service.list_messages(group_id, params, current_user)
 
 @router.post("/groups/{group_id}/search")
 def search_group_mails(
@@ -90,6 +119,21 @@ def list_attachments(message_id: int):
     service = MailService()
     return service.list_attachments(message_id)
 
+@router.post("/batch/download")
+def batch_download_mail_content(
+        req: BatchDownloadRequest,
+        current_user: dict = Depends(get_current_user)
+):
+    """
+    [多线程] 批量下载邮件完整内容
+    """
+
+    task = batch_download_task.delay(user_id=current_user["id"], message_ids=req.message_ids)
+    return {
+        "success": True,
+        "message": "下载任务已在后台启动",
+        "task_id": task.id
+    }
 
 @router.post("/{message_id}/download")
 def download_mail_content(message_id: int):
@@ -100,17 +144,3 @@ def download_mail_content(message_id: int):
     service = MailService()
     return service.download_mail(message_id)
 
-@router.post("/batch/download")
-def batch_download_mail_content(
-        req: BatchDownloadRequest,
-        current_user: dict = Depends(get_current_user)
-):
-    """
-    [多线程] 批量下载邮件完整内容
-    """
-    service = MailService()
-    result = service.batch_download_content(req.message_ids)
-    if not result["success"]:
-        if "数据库写入失败" in result.get("message", ""):
-            raise HTTPException(500, result["message"])
-    return result

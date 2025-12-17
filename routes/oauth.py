@@ -66,42 +66,52 @@ async def get_sync_tasks_status(current_user: dict = Depends(get_current_user)):
     return {"success": True, "tasks": statuses, "count": len(statuses)}
 
 
-@router.delete("/auth/login/groups/{group_id}")
+@router.delete("/auth/login/cancel")
 async def cancel_group_login(
-        group_id: str,
         current_user: dict = Depends(get_current_user)
 ):
     """
-    取消单个登录任务
+    取消所有登录任务
     前端逻辑: 用户点击登录任务列表中的"取消"按钮时调用
     """
     service = OAuthService()
     # 明确指定 task_type="login"
-    cancelled = service.cancel_task_by_type(
-        group_id=group_id,
-        user_id=current_user["id"],
-        task_type="login"
-    )
-    return {"success": True, "cancelled": cancelled, "message": "登录任务已取消"}
+    count = service.cancel_all_tasks_by_type( user_id=current_user["id"], task_type="login")
+    return {
+        "success": True,
+        "cancelled_count": count,
+        "message": f"已取消所有登录任务 (共{count}个)"
+    }
 
 
-@router.delete("/auth/sync/groups/{group_id}")
+@router.delete("/auth/sync/cancel")
 async def cancel_group_sync(
-        group_id: str,
         current_user: dict = Depends(get_current_user)
 ):
     """
-    取消单个同步任务
+    取消所有同步任务
     前端逻辑: 用户点击同步任务列表中的"取消"按钮时调用
     """
     service = OAuthService()
     # 明确指定 task_type="sync"
-    cancelled = service.cancel_task_by_type(
-        group_id=group_id,
+    count_sync = service.cancel_all_tasks_by_type(
         user_id=current_user["id"],
         task_type="sync"
     )
-    return {"success": True, "cancelled": cancelled, "message": "同步任务已取消"}
+
+    # 2. 取消文件夹同步任务 (sync_folders) - 既然是"全部同步任务"，通常也包含目录同步
+    count_folders = service.cancel_all_tasks_by_type(
+        user_id=current_user["id"],
+        task_type="sync_folders"
+    )
+
+    total = count_sync + count_folders
+
+    return {
+        "success": True,
+        "cancelled_count": total,
+        "message": f"已取消所有同步任务 (共{total}个)"
+    }
 
 
 @router.post("/auth/sync/folders/{group_id}")
@@ -122,5 +132,5 @@ async def manual_sync_folders(
     return {
         "success": True,
         "message": "目录同步任务已提交",
-        "task_id":task_id
+        "task_id": task_id
     }

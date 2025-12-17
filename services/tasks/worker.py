@@ -1,12 +1,14 @@
 """
 Celery Worker 任务定义
 """
+from typing import List
+
 import settings
-import traceback
-from celery import shared_task
 from celery.utils.log import get_task_logger
 
 from auth.msal_client import MSALClient
+from celery_app import celery_app
+from services import MailService
 from services.mail_sync import MailSyncManager
 from services.tasks.async_adapter import AsyncMailSyncManager
 from services.tasks.utils import user_concurrency_guard, update_task_status
@@ -42,11 +44,14 @@ def _create_msal_client(token_uuid: str = None):
     )
 # ================= 邮件同步任务 =================
 
-@shared_task(bind=True, name="tasks.sync_group")
+@celery_app.task(bind=True, name="tasks.sync_group")
 def sync_group_task(self, group_id: str, user_id: int, role: str, strategy: str = "auto"):
     """同步任务"""
     TASK_TYPE = "sync"
-    update_task_status(user_id, group_id, TASK_TYPE, "RUNNING", "初始化同步...", ttl=3600)
+    update_task_status(
+        user_id, group_id, TASK_TYPE, "RUNNING", "初始化同步...",
+        ttl=3600, task_id=self.request.id
+    )
 
     with user_concurrency_guard(self, user_id, role):
         try:
@@ -82,7 +87,7 @@ def sync_group_task(self, group_id: str, user_id: int, role: str, strategy: str 
 
 # ================= 登录任务 =================
 
-@shared_task(bind=True, name="tasks.login_group")
+@celery_app.task(bind=True, name="tasks.login_group")
 def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin: bool = False):
     """
     异步登录任务
@@ -90,7 +95,10 @@ def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin
     因此我们在 Worker 中直接写入数据库，不走 Redis 队列。
     """
     TASK_TYPE = "login"
-    update_task_status(user_id, group_id, TASK_TYPE, "RUNNING", "正在登录...", ttl=3600)
+    update_task_status(
+        user_id, group_id, TASK_TYPE, "RUNNING", "正在登录...",
+        ttl=3600, task_id=self.request.id
+    )
     with user_concurrency_guard(self, user_id, role):
         try:
             # 1. 准备账号数据
@@ -165,7 +173,7 @@ def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin
 
 # ================= 保活任务 (Beat) =================
 
-@shared_task(name="tasks.maintenance_check")
+@celery_app.task(name="tasks.maintenance_check")
 def maintenance_check_task():
     """
     [定时任务] 每天检查一次，找出 >85 天未活动的账号进行保活
@@ -201,11 +209,14 @@ def maintenance_check_task():
 
 
 # 同步文件夹任务
-@shared_task(bind=True, name="tasks.sync_folders")
+@celery_app.task(bind=True, name="tasks.sync_folders")
 def sync_folders_task(self, group_id: str, user_id: int, role: str):
     """手动同步文件夹结构"""
     TASK_TYPE = "sync_folders"  # 使用独立的任务类型，避免混淆
-    update_task_status(user_id, group_id, TASK_TYPE, "RUNNING", "正在更新目录...", ttl=3600)
+    update_task_status(
+        user_id, group_id, TASK_TYPE, "RUNNING", "正在更新目录...",
+        ttl=3600, task_id=self.request.id
+    )
 
     with user_concurrency_guard(self, user_id, role):
         try:
@@ -223,3 +234,43 @@ def sync_folders_task(self, group_id: str, user_id: int, role: str):
 
         except Exception as e:
             update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", str(e), ttl=60)
+
+
+@celery_app.task(bind=True, name="tasks.batch_download")
+def batch_download_task(self, user_id: int, message_ids: List[int], group_id: str = "GLOBAL"):
+    TASK_TYPE = "download"
+    update_task_status(
+        user_id, group_id, TASK_TYPE, "RUNNING",
+        f"准备下载 {len(message_ids)} 封邮件...",
+        ttl=3600,
+        task_id=self.request.id
+    )
+    try:
+        service = MailService()
+
+        # 定义进度回调 (让 Service 层在多线程下载时能汇报进度)
+        def progress_callback(current, total):
+            pct = int((current / total) * 100)
+            update_task_status(
+                user_id, group_id, TASK_TYPE, "RUNNING",
+                f"正在下载 {pct}% ({current}/{total})",
+                ttl=3600
+            )
+
+        # 2. 执行业务逻辑 (这里面依然用 ThreadPoolExecutor 加速)
+        result = service.batch_download_content(
+            message_ids,
+            progress_callback=progress_callback
+        )
+
+        # 3. 处理结果
+        if result["success"]:
+            msg = f"下载完成: 成功 {result['downloaded']}, 跳过 {result['skipped']}"
+            if result['errors']:
+                msg += f", 失败 {len(result['errors'])}"
+            update_task_status(user_id, group_id, TASK_TYPE, "SUCCESS", msg, ttl=60)
+        else:
+            update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", result.get("message"), ttl=60)
+
+    except Exception as e:
+        update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", f"异常: {str(e)}", ttl=60)

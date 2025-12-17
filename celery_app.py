@@ -4,7 +4,6 @@ import settings
 
 # 初始化 Celery
 celery_app = Celery("mail_system", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
-
 # 配置优化
 celery_app.conf.update(
     result_expires=3600,         # 结果过期时间
@@ -33,4 +32,5 @@ class RedisKeys:
     TASK_STATUS_TEMPLATE = "sys:status:user:{user_id}:type:{task_type}:group:{group_id}"
 
 # 自动发现任务
-celery_app.autodiscover_tasks(['services.tasks'])
+celery_app.autodiscover_tasks(['services.tasks.worker'])
+celery_app.set_default()

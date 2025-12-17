@@ -12,7 +12,7 @@ redis_client = redis.from_url(settings.REDIS_URL)
 
 # ==================== 状态管理 (带类型) ====================
 
-def update_task_status(user_id: int, group_id: str, task_type: str, status: str, message: str, ttl: int = 3600):
+def update_task_status(user_id: int, group_id: str, task_type: str, status: str, message: str, ttl: int = 3600,task_id: str = None):
     """
     更新任务状态 (区分 login/sync)
     task_type: 'login' | 'sync'
@@ -20,26 +20,36 @@ def update_task_status(user_id: int, group_id: str, task_type: str, status: str,
     key = RedisKeys.TASK_STATUS_TEMPLATE.format(
         user_id=user_id, task_type=task_type, group_id=group_id
     )
-
+    current_task_id = task_id
+    if not current_task_id:
+        try:
+            # 如果本次没传 task_id，尝试从旧数据捞取
+            existing_raw = redis_client.get(key)
+            if existing_raw:
+                existing_data = json.loads(existing_raw)
+                current_task_id = existing_data.get("task_id")
+        except Exception:
+            pass
     data = {
         "group_id": group_id,
         "type": task_type,
         "status": status,
         "message": message,
-        "updated_at": int(time.time())
+        "updated_at": int(time.time()),
+        "task_id": current_task_id  # 【修复】写入 task_id
     }
 
     redis_client.setex(key, ttl, json.dumps(data))
 
-def get_task_status_raw(user_id: int, group_id: str, task_type: str) -> Optional[Dict]:
-    """获取原始状态 (用于同类型去重)"""
+def get_task_status(user_id: int, group_id: str, task_type: str):
+    """从 Redis 获取任务状态详情"""
     key = RedisKeys.TASK_STATUS_TEMPLATE.format(
         user_id=user_id, task_type=task_type, group_id=group_id
     )
-    val = redis_client.get(key)
-    if val:
+    data = redis_client.get(key)
+    if data:
         try:
-            return json.loads(val)
+            return json.loads(data)
         except:
             return None
     return None
@@ -102,17 +112,3 @@ def user_concurrency_guard(task_instance, user_id: int, role: str):
         yield
     finally:
         sem.release()
-
-def make_status_key(user_id, group_id, task_type):
-    return f"task:{user_id}:{group_id}:{task_type}"
-
-def get_task_status(user_id, group_id, task_type):
-    """从 Redis 获取任务状态详情"""
-    key = make_status_key(user_id, group_id, task_type)
-    data = redis_client.get(key)
-    if data:
-        try:
-            return json.loads(data)
-        except:
-            return None
-    return None

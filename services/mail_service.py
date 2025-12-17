@@ -1,8 +1,10 @@
 """邮件业务逻辑服务"""
+import json
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable
 
+import redis
 import requests
 from fastapi import HTTPException
 
@@ -354,7 +356,7 @@ class MailService:
 
         if search.has_attachments is not None:
             op = ">" if search.has_attachments else "="
-            conditions.append(f"attachments_count {op} 0")
+            conditions.append(f"has_attachments {op} 0")
 
         if search.is_unread is not None:
             if search.is_unread:
@@ -383,7 +385,7 @@ class MailService:
         select_fields = """
             id, group_id, account_id, subject, from_addr, from_name, 
             to_joined, folder_id, sent_at, received_at, size_bytes, 
-            attachments_count, flags, snippet
+            has_attachments, flags, snippet
         """
 
         page = search.page or 1
@@ -409,7 +411,7 @@ class MailService:
             "pages": (total + size - 1) // size
         }
 
-    def download_mail(self,message_id: int):
+    def download_mail(self, message_id: int):
         # 获取邮件基本信息
         with get_db() as db:
             mail = db.execute(
@@ -504,18 +506,14 @@ class MailService:
             traceback.print_exc()
             raise HTTPException(500, f"下载邮件内容失败: {str(e)}")
 
-    def batch_download_content(self, message_ids: List[int], max_workers: int = 10) -> Dict[str, Any]:
+    def batch_download_content(self, message_ids: List[int], max_workers: int = 10,
+                               progress_callback: Optional[Callable[[int, int], None]] = None
+                               ) -> Dict[str, Any]:
         """
-        [高性能优化版] 批量下载邮件内容 + 附件元数据
-        策略:
-        1. 智能过滤: 自动跳过已下载邮件
-        2. 按组预取 Token
-        3. 携带 Token 多线程并发下载 (只拿元数据，不下载附件实体)
-        4. 批量事务写入 Body 和 Attachment
+        批量下载邮件内容 + 附件元数据
         """
         if not message_ids:
             return {"success": True, "total": 0, "downloaded": 0, "skipped": 0, "errors": []}
-
 
         # --- 1. 准备元数据 & 智能过滤 ---
         tasks_metadata = []
@@ -543,6 +541,11 @@ class MailService:
         skipped_count = total_requested - to_download_count
 
         if not tasks_metadata:
+            if progress_callback:
+                try:
+                    progress_callback(total_requested, total_requested)
+                except:
+                    pass
             return {
                 "success": True,
                 "total_requested": total_requested,
@@ -604,6 +607,8 @@ class MailService:
         # --- 4. 并发执行 ---
         success_results = []
         download_errors = []
+        completed_count = 0
+        total_tasks = len(tasks_metadata)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
@@ -621,22 +626,31 @@ class MailService:
                     download_errors.append(res["error"])
                 else:
                     success_results.append(res)
+                completed_count += 1
+                if progress_callback:
+                    try:
+                        progress_callback(completed_count, total_tasks)
+                    except Exception:
+                        pass  # 忽略回调错误
 
         # --- 5. 批量写入 DB (Body + Attachments) ---
         if success_results:
             try:
-                with get_db() as db:
-                    begin_tx(db)
-                    sql_body = """
-                        INSERT OR REPLACE INTO mail_body (message_id, headers, body_plain, body_html)
-                        VALUES (?, ?, ?, ?)
-                    """
-                    data_body = [
-                        (item["message_id"], item["headers"], item["body_plain"], item["body_html"])
-                        for item in success_results
-                    ]
-                    db.executemany(sql_body, data_body)
-                    commit_tx(db)
+                redis_client = redis.from_url(settings.REDIS_URL)
+                pipe = redis_client.pipeline()
+                for item in success_results:
+                    # 构造写入任务
+                    payload = {
+                        "table": "mail_body",
+                        "data": {
+                            "message_id": item["message_id"],
+                            "headers": item["headers"],
+                            "body_plain": item["body_plain"],
+                            "body_html": item["body_html"],
+                        }
+                    }
+                    pipe.lpush("sys:db_write_queue", json.dumps(payload, default=str))
+                pipe.execute()
             except Exception as e:
                 logger.error(f"Batch save failed: {e}")
                 return {"success": False, "message": f"Save failed: {str(e)}"}

@@ -1,6 +1,5 @@
 """FastAPI 应用工厂"""
-from contextlib import asynccontextmanager
-
+from celery_app import celery_app
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
