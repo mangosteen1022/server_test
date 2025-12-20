@@ -80,14 +80,20 @@ CREATE TABLE IF NOT EXISTS account_recovery_phone (
 );
 CREATE INDEX IF NOT EXISTS idx_recovery_phone_phone ON account_recovery_phone(phone);
 
---msal cache key表
-CREATE TABLE IF NOT EXISTS account_token_cache (
-  group_id    TEXT NOT NULL,
-  uuid        TEXT NOT NULL COLLATE NOCASE CHECK (uuid = lower(uuid)),
-  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc')),
-  PRIMARY KEY (group_id, uuid)
+--msal token表
+CREATE TABLE IF NOT EXISTS account_token (
+    group_id      TEXT PRIMARY KEY,
+    access_token  TEXT NOT NULL,    -- 用于 API 请求 (有效期通常 60-90 分钟)
+    refresh_token TEXT NOT NULL,    -- 用于换取新 AT (有效期 90天-永久)
+    id_token      TEXT,             -- OIDC 身份令牌 (包含用户信息，可选)
+    at_expires_at INTEGER NOT NULL, -- access_token过期时间(3600s)
+    rt_expires_at INTEGER NOT NULL, -- refresh_token过期时间(90days)
+    scope         TEXT,             -- 记录授权范围 (e.g. "Mail.Read User.Read")
+    tenant_id     TEXT,             -- 微软的 Tenant ID (多租户应用必存)
+    created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc')),
+    updated_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc'))
 );
-CREATE INDEX IF NOT EXISTS idx_token_cache_uuid ON account_token_cache(group_id);
+CREATE INDEX IF NOT EXISTS idx_account_token_group ON account_token(group_id);
 
 CREATE TABLE IF NOT EXISTS account_version (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,14 +117,10 @@ CREATE INDEX IF NOT EXISTS idx_accver_accid_ver ON account_version(group_id, ver
 CREATE TABLE IF NOT EXISTS mail_message (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id           TEXT NOT NULL,
-  account_id         INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
-
   msg_uid            TEXT,
   msg_id             TEXT,
-
   subject            TEXT NOT NULL DEFAULT '',
   subject_lc         TEXT GENERATED ALWAYS AS (lower(subject)) STORED,
-
   from_addr          TEXT NOT NULL DEFAULT '',
   from_addr_lc       TEXT GENERATED ALWAYS AS (lower(from_addr)) STORED,
   from_name          TEXT,
@@ -160,12 +162,14 @@ CREATE INDEX IF NOT EXISTS idx_mail_acc_folder
 CREATE TABLE IF NOT EXISTS mail_recipient (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id   INTEGER NOT NULL REFERENCES mail_message(id) ON DELETE CASCADE,
-  account_id   INTEGER NOT NULL REFERENCES accounts(id) ON DELETE SET NULL,
-  kind         TEXT NOT NULL DEFAULT 'to',
+  kind         TEXT NOT NULL DEFAULT 'to' CHECK (kind IN ('to','cc','bcc')),
+  display_name TEXT,
   addr         TEXT NOT NULL,
   addr_lc      TEXT GENERATED ALWAYS AS (lower(addr)) STORED,
-  CHECK (kind IN ('to','cc','bcc'))
+  UNIQUE(message_id, addr_lc)
 );
+
+
 CREATE INDEX IF NOT EXISTS idx_rec_acc_addr ON mail_recipient(account_id, addr_lc, message_id);
 CREATE INDEX IF NOT EXISTS idx_rec_msg ON mail_recipient(message_id);
 
@@ -180,36 +184,38 @@ CREATE TABLE IF NOT EXISTS mail_body (
 CREATE TABLE IF NOT EXISTS mail_attachment (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id     INTEGER NOT NULL REFERENCES mail_message(id) ON DELETE CASCADE,
-  group_id       TEXT NOT NULL,
-  storage_url    TEXT NOT NULL,
+  attachment_id  TEXT NOT NULL,
+  filename TEXT,           -- 显示的文件名 (如 "invoice.pdf")
+  content_type TEXT,       -- MIME 类型 (如 "application/pdf", "image/png")
+  size INTEGER DEFAULT 0,  -- 文件大小 (字节)，用于前端显示和磁盘空间预判
+-- 如果是正文截图，is_inline=1，且 content_id 会有值 (如 "cid:image001")
+-- 渲染邮件 HTML 时，需要用本地路径替换 src="cid:..."
+  is_inline BOOLEAN DEFAULT 0,
+  content_id TEXT,
+-- 6. 存储与状态
+  file_path TEXT,          -- 磁盘上的绝对路径或相对路径 (下载成功后填入)
+  download_status TEXT DEFAULT 'PENDING' CHECK (download_status IN ('PENDING','DOWNLOADING','DONE','FAILED')),
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc'))
 );
-CREATE INDEX IF NOT EXISTS idx_attach_msg ON mail_attachment(message_id);
-CREATE INDEX IF NOT EXISTS idx_attach_acc ON mail_attachment(group_id, id);
-
---邮箱文件夹
-CREATE TABLE IF NOT EXISTS mail_folder (
-    id TEXT NOT NULL,                       -- Graph API的文件夹ID
-    group_id TEXT NOT NULL,
-    display_name TEXT NOT NULL,             -- 显示名称（如"收件箱"、"Inbox"）
-    well_known_name TEXT,                   -- 标准名称（inbox, sent, drafts, deleted, junk, archive）
-    parent_folder_id TEXT,                  -- 父文件夹ID
-    PRIMARY KEY (id, group_id)
+CREATE INDEX IF NOT EXISTS idx_mail_attachment_msg_id ON mail_attachment(message_id);
+CREATE INDEX IF NOT EXISTS idx_mail_attachment_ms_id ON mail_attachment(attachment_id);
+--邮箱目录
+CREATE TABLE IF NOT EXISTS mail_folders (
+    folder_id        TEXT PRIMARY KEY,   -- Graph API 的 folder ID
+    group_id         TEXT NOT NULL,      --区分属于哪个账户
+    display_name     TEXT NOT NULL,
+    well_known_name  TEXT,               -- inbox, sentitems, drafts 等
+    parent_folder_id TEXT,
+    total_count      INTEGER DEFAULT 0,  -- 文件夹内邮件总数
+    unread_count     INTEGER DEFAULT 0,
+    delta_link       TEXT,               -- 该文件夹的 Delta Link
+    skip_token       TEXT,
+    last_sync_at     TEXT,               -- 该文件夹上次同步时间
+    last_msg_uid     TEXT,               -- 该文件夹上次同步时间
+    synced_count     INTEGER DEFAULT 0,  -- 该文件夹已同步数量
+    updated_at       TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc'))
 );
-
-CREATE INDEX IF NOT EXISTS idx_folder_account ON mail_folder(group_id);
-CREATE INDEX IF NOT EXISTS idx_folder_well_known ON mail_folder(group_id, well_known_name);
-
---邮箱同步状态
-CREATE TABLE IF NOT EXISTS mail_sync_state (
-    group_id    TEXT PRIMARY KEY,
-    last_sync_time TEXT,
-    last_msg_uid TEXT,
-    delta_link TEXT,  -- Microsoft Graph的deltaLink
-    skip_token TEXT,   -- 分页token
-    total_synced INTEGER DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now','utc'))
-);
+CREATE INDEX IF NOT EXISTS idx_mail_folders_group ON mail_folders(group_id);
 
 COMMIT;
 PRAGMA user_version = 5;

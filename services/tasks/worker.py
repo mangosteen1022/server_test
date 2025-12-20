@@ -1,7 +1,8 @@
 """
 Celery Worker 任务定义
 """
-from typing import List
+import time
+from typing import List, Optional, Dict
 
 import settings
 from celery.utils.log import get_task_logger
@@ -10,7 +11,6 @@ from auth.msal_client import MSALClient
 from celery_app import celery_app
 from services import MailService
 from services.mail_sync import MailSyncManager
-from services.tasks.async_adapter import AsyncMailSyncManager
 from services.tasks.utils import user_concurrency_guard, update_task_status
 from database.factory import get_db, begin_tx, commit_tx
 from utils.logger import get_logger
@@ -19,29 +19,33 @@ from utils.logger import get_logger
 celery_logger = get_task_logger(__name__)
 sys_logger = get_logger(__name__)
 
-
-def _get_cached_token_uuid(group_id: str):
-    """直接从数据库获取缓存 UUID"""
-    try:
-        with get_db() as db:
-            row = db.execute(
-                "SELECT uuid FROM account_token_cache WHERE group_id=?",
-                (group_id,)
-            ).fetchone()
-            return row["uuid"] if row else None
-    except Exception as e:
-        celery_logger.error(f"DB error getting token for {group_id}: {e}")
-        return None
-
-def _create_msal_client(token_uuid: str = None):
-    """直接创建 MSAL 客户端"""
+def _create_msal_client(group_id: str):
+    """
+    直接创建 MSAL 客户端
+    不再依赖 token_uuid，直接通过 group_id 操作 account_token 表
+    """
     return MSALClient(
         client_id=settings.MSAL_CLIENT_ID,
         authority=settings.MSAL_AUTHORITY,
         scopes=settings.MSAL_SCOPES,
-        token_uuid=token_uuid,
+        group_id=group_id,
         default_port=settings.MSAL_REDIRECT_PORT
     )
+def get_token_from_db(group_id) -> Optional[Dict]:
+    """从数据库读取 Token 记录"""
+    try:
+        with get_db() as db:
+            row = db.execute(
+                """
+                SELECT access_token, refresh_token, at_expires_at 
+                FROM account_token 
+                WHERE group_id = ?
+                """,
+                (group_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        return None
 # ================= 邮件同步任务 =================
 
 @celery_app.task(bind=True, name="tasks.sync_group")
@@ -59,19 +63,14 @@ def sync_group_task(self, group_id: str, user_id: int, role: str, strategy: str 
             def progress_callback(gid, msg):
                 update_task_status(user_id, gid, TASK_TYPE, "RUNNING", msg, ttl=3600)
 
-            token_uuid = _get_cached_token_uuid(group_id)
-            if not token_uuid:
-                update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", "未登录", ttl=60)
-                return
-
-            msal_client = _create_msal_client(token_uuid)
-            manager = AsyncMailSyncManager()
+            msal_client = _create_msal_client(group_id)
+            manager = MailSyncManager()
 
             result = manager.sync_group_mails(
                 group_id=group_id,
                 msal_client=msal_client,
                 strategy=strategy,
-                progress_callback=progress_callback
+                cb=progress_callback
             )
 
             status = "SUCCESS" if result.get("success") else "FAILURE"
@@ -128,11 +127,13 @@ def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin
             rec_email = rec_email_row["email"] if rec_email_row else None
             rec_phone = rec_phone_row["phone"] if rec_phone_row else None
 
-            token_uuid = None if force_relogin else _get_cached_token_uuid(group_id)
-            msal_client = _create_msal_client(token_uuid)
+            msal_client = _create_msal_client(group_id)
+            if force_relogin:
+                msal_client.logout()
+
             result = msal_client.acquire_token_by_automation(
                 email=primary_account['email'],  # 传入 dict
-                password = primary_account['password'],
+                password=primary_account['password'],
                 recovery_email=rec_email,
                 recovery_phone=rec_phone
             )
@@ -140,15 +141,14 @@ def login_group_task(self, group_id: str, user_id: int, role: str, force_relogin
             # 3. 处理结果 (直接写库，因为是低频高重要性数据)
             if result.get("success"):
                 update_task_status(user_id, group_id, TASK_TYPE, "SUCCESS", "登录成功", ttl=60)
-                new_token_uuid = _get_cached_token_uuid(group_id)
-                sync_client = _create_msal_client(new_token_uuid)
                 sync_manager = MailSyncManager()
-                folder_res = sync_manager.sync_only_folders(group_id, sync_client)
+                folder_res = sync_manager.sync_folders(group_id, msal_client)
                 if folder_res["success"]:
                     msg = f"登录成功 (目录: {folder_res['count']}个)"
                 else:
                     msg = f"登录成功 (目录同步失败: {folder_res.get('error')})"
-                # TODO 更新的数据保存
+                update_task_status(user_id, group_id, TASK_TYPE, "SUCCESS", msg, ttl=60)
+                # TODO 更新的数据保存,快照更新
                 # 如果自动化脚本修改了密码，这里需要更新数据库
                 # 假设 result 包含 new_password 字段
                 new_password = result.get("new_password")
@@ -183,20 +183,16 @@ def maintenance_check_task():
     try:
         # 1. 找出快过期的 group_id (这里假设你有 last_sync_time 字段)
         # 如果没有专门字段，可以用 mail_sync_state 表的 last_sync_time
+        threshold = int(time.time()) + (5 * 86400)
         with get_db() as db:
             # 查找 mail_sync_state 中上次同步时间超过 85 天的
-            query = """
-                    SELECT group_id \
-                    FROM mail_sync_state
-                    WHERE last_sync_time < datetime('now', '-85 days') \
-                    """
-            rows = db.execute(query).fetchall()
+            query = "SELECT group_id FROM account_token WHERE rt_expires_at < ?"
+            rows = db.execute(query, (threshold,)).fetchall()
 
         celery_logger.info(f"Found {len(rows)} groups needing maintenance")
 
         # 2. 触发轻量级同步任务
         for row in rows:
-            # 使用 'check' 策略，只读一封邮件
             sync_group_task.delay(
                 group_id=row["group_id"],
                 user_id=0,  # 系统操作
@@ -220,13 +216,12 @@ def sync_folders_task(self, group_id: str, user_id: int, role: str):
 
     with user_concurrency_guard(self, user_id, role):
         try:
-            token_uuid = _get_cached_token_uuid(group_id)
-            if not token_uuid:
+            client = _create_msal_client(group_id)
+            if not client.get_access_token():
                 update_task_status(user_id, group_id, TASK_TYPE, "FAILURE", "未登录", ttl=60)
                 return
-            client = _create_msal_client(token_uuid)
             manager = MailSyncManager()
-            res = manager.sync_only_folders(group_id, client)
+            res = manager.sync_folders(group_id, client)
             if res["success"]:
                 update_task_status(user_id, group_id, TASK_TYPE, "SUCCESS", f"目录更新完成 ({res['count']}个)", ttl=60)
             else:
@@ -250,10 +245,9 @@ def batch_download_task(self, user_id: int, message_ids: List[int], group_id: st
 
         # 定义进度回调 (让 Service 层在多线程下载时能汇报进度)
         def progress_callback(current, total):
-            pct = int((current / total) * 100)
             update_task_status(
                 user_id, group_id, TASK_TYPE, "RUNNING",
-                f"正在下载 {pct}% ({current}/{total})",
+                f"正在下载({current}/{total})",
                 ttl=3600
             )
 

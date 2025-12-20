@@ -1,50 +1,39 @@
 """邮件同步管理器 - 重构版，完全基于 group_id"""
-
-import sqlite3
+import json
 import re
 import traceback
 from typing import Dict, List, Any, Optional, Callable
 
 from auth.msal_client import MSALClient
+from celery_app import RedisKeys
 from utils.time_utils import utc_now, utc_days_ago
 from database.factory import get_db
+import redis, settings
+
+redis_client = redis.from_url(settings.REDIS_URL)
 
 
 class MailSyncManager:
     """邮件同步管理器"""
 
-    def sync_only_folders(
-            self,
-            group_id: str,
-            msal_client: MSALClient
-    ) -> Dict[str, Any]:
+    def sync_folders(self, group_id: str, msal_client: MSALClient) -> Dict[str, Any]:
         """
-        [独立功能] 同步完整文件夹目录树 (不含隐藏文件夹，含子文件夹)
+        同步完整文件夹目录树(不含隐藏文件夹，含子文件夹)
         """
         try:
-            # 1. 获取根目录文件夹
-            # 此时调用的是我们刚改过的 list_mail_folders (不含隐藏)
             root_resp = msal_client.list_mail_folders(top=100)
             root_folders = root_resp.get("value", [])
-
             if not root_folders:
                 return {"success": True, "count": 0, "message": "无文件夹"}
-
             folder_queue = list(root_folders)
-
-            # 使用索引遍历，因为我们在遍历过程中会往列表末尾追加新元素
             i = 0
             while i < len(folder_queue):
                 current_folder = folder_queue[i]
                 i += 1
-
-                # 检查是否有子文件夹
                 child_count = current_folder.get("childFolderCount", 0)
                 f_id = current_folder.get("id")
-
                 if child_count > 0 and f_id:
                     try:
-                        # 获取子文件夹并追加到队列末尾
                         child_resp = msal_client.list_child_folders(f_id, top=100)
                         children = child_resp.get("value", [])
                         if children:
@@ -60,17 +49,22 @@ class MailSyncManager:
                     display_name = folder.get("displayName")
                     parent_id = folder.get("parentFolderId")
                     well_known = folder.get("wellKnownName")
-
-                    # 注意：根据最新的 schema.sql，主键是 folder_id
+                    total_count = folder.get("totalItemCount")
+                    unread_count = folder.get("unreadItemCount")
+                    updated_at = str(utc_now())
                     db.execute("""
-                               INSERT INTO mail_folder (id, group_id, display_name, well_known_name,
-                                                        parent_folder_id)
-                               VALUES (?, ?, ?, ?, ?)
-                               ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,
-                                                                    parent_folder_id=excluded.parent_folder_id
-                               """, (folder_id, group_id, display_name, well_known, parent_id))
+                               INSERT INTO mail_folders (folder_id, group_id, display_name, well_known_name,
+                                                         parent_folder_id, total_count, unread_count, updated_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(folder_id) DO UPDATE SET display_name=excluded.display_name,
+                                                                    parent_folder_id=excluded.parent_folder_id,
+                                                                    total_count=excluded.total_count,
+                                                                    unread_count=excluded.unread_count,
+                                                                    updated_at = excluded.updated_at
+                               """,
+                               (folder_id, group_id, display_name, well_known, parent_id, total_count, unread_count,
+                                updated_at))
                     total_synced += 1
-
                 db.commit()
 
             return {
@@ -83,13 +77,12 @@ class MailSyncManager:
             traceback.print_exc()
             return {"success": False, "error": str(e)}
 
-
     def sync_group_mails(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        strategy: str = "auto",
-        progress_callback: Optional[Callable[[str, str], None]] = None,
+            self,
+            group_id: str,
+            msal_client: MSALClient,
+            strategy: str = "auto",
+            cb: Optional[Callable[[str, str], None]] = None,
     ) -> Dict[str, Any]:
         """
         同步邮箱组邮件（主入口）
@@ -100,9 +93,11 @@ class MailSyncManager:
             strategy: 同步策略
                 - "auto": 自动选择（优先delta > incremental > recent）
                 - "full": 完整同步所有邮件
+                - "delta": 强制使用 Delta 同步
                 - "incremental": 增量同步（基于时间）
                 - "recent": 同步最近的邮件
-            progress_callback: 进度回调函数 (group_id, message)
+                - "check": 仅保活检查
+            cb: 进度回调函数 (group_id, message)
 
         Returns:
             {
@@ -114,679 +109,304 @@ class MailSyncManager:
             }
         """
         try:
-            return self._sync_group_mails_with_db(
-                group_id=group_id,
-                msal_client=msal_client,
-                strategy=strategy,
-                progress_callback=progress_callback
-            )
-        except Exception as e:
-            traceback.print_exc()
-            return {"success": False, "error": str(e), "synced": 0}
-
-    def _sync_group_mails_with_db(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        strategy: str = "auto",
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """内部方法，使用已存在的数据库连接"""
-        try:
             # 1. 获取同步状态
-            sync_state = self.get_sync_state(group_id)
-            if strategy == "check":
-                return self.sync_check(group_id, msal_client, progress_callback)
+            folders = self._get_local_folders(group_id)
+            if not folders:
+                return {"success": False, "error": "未找到本地文件夹记录，请先执行目录同步", "synced": 0}
+            if cb:
+                cb(group_id, f"开始同步邮件 (策略: {strategy})")
+            total_synced = 0
+            total_fetched = 0
+            errors = []
+            sync_start_time = utc_now()
+            for folder in folders:
+                f_name = folder["display_name"]
+                if folder["total_count"] == 0:
+                    continue
+                if cb:
+                    cb(group_id, f"正在同步: {f_name}")
+                try:
+                    args = (group_id, msal_client, folder, sync_start_time, cb)
+                    if strategy == "full":
+                        res = self._sync_folder_full(*args)
+                    elif strategy == "recent":
+                        res = self._sync_folder_recent(*args)
+                    else:  # auto
+                        if folder["delta_link"]:
+                            res = self._sync_folder_delta(*args)
+                        elif folder["last_sync_at"]:
+                            res = self._sync_folder_incremental(*args)
+                        else:
+                            res = self._sync_folder_recent(*args)
 
-            if progress_callback:
-                progress_callback(group_id, f"开始同步邮件 (策略: {strategy})")
+                    total_synced += res.get("synced", 0)
+                    total_fetched += res.get("fetched", 0)
 
-            # 2. 根据策略选择同步方式
-            if strategy == "auto":
-                if sync_state.get("delta_link"):
-                    result = self.sync_with_delta(group_id, msal_client, sync_state, progress_callback)
-                elif sync_state.get("last_sync_time"):
-                    result = self.sync_incremental(group_id, msal_client, sync_state, progress_callback)
-                else:
-                    result = self.sync_recent(group_id, msal_client, progress_callback)
-            elif strategy == "full":
-                result = self.sync_full(group_id, msal_client, sync_state, progress_callback)
-            elif strategy == "incremental":
-                result = self.sync_incremental(group_id, msal_client, sync_state, progress_callback)
-            else:  # recent
-                result = self.sync_recent(group_id, msal_client, progress_callback)
+                except Exception as e:
+                    err_msg = f"文件夹 {f_name} 同步失败: {str(e)}"
+                    errors.append(err_msg)
+                success_msg = f"同步完成，共入库 {total_synced} 封"
+                if errors:
+                    success_msg += f" (有 {len(errors)} 个错误)"
 
-            # 3. 更新同步状态
-            if result.get("success"):
-                self.update_sync_state(group_id, result.get("sync_state", {}))
-
-            return result
-
+                if cb:
+                    cb(group_id, success_msg)
+                return {
+                    "success": len(errors) == 0,
+                    "synced": total_synced,
+                    "total_fetched": total_fetched,
+                    "errors": errors,
+                    "message": f"同步完成，共入库 {total_synced} 封"
+                }
         except Exception as e:
             traceback.print_exc()
             return {"success": False, "error": str(e), "synced": 0}
 
-    def sync_check(
+    @staticmethod
+    def _get_local_folders(group_id: str) -> List[Dict[str, Any]]:
+        """
+        从本地数据库加载文件夹映射
+        Return: { "Graph_Folder_ID": Local_DB_ID }
+        """
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT * FROM mail_folders WHERE group_id = ?",
+                (group_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    @staticmethod
+    def _update_folder_state(folder_id: str, data: Dict):
+        """更新文件夹同步状态"""
+        # 动态构建 SET 语句
+        set_clause = ", ".join([f"{k} = ?" for k in data.keys()])
+        params = list(data.values())
+        params.append(folder_id)
+
+        with get_db() as db:
+            db.execute(
+                f"UPDATE mail_folders SET {set_clause} WHERE folder_id = ?",
+                params
+            )
+            db.commit()
+
+    def _sync_folder_delta(self, group_id: str, client: MSALClient, folder: Dict, sync_time: str, cb) -> Dict:
+        """策略：Delta 同步 (最高效)"""
+        folder_id = folder["folder_id"]
+        delta_link = folder["delta_link"]
+        folder_name = folder["display_name"]
+
+        total_synced = 0
+        new_delta_link = None
+
+        # 1. 循环获取变更页
+        while delta_link:  # TODO 详细进度
+            if cb: cb(group_id, f"同步 {folder_name}: 获取变更中...")
+            resp = client.get_messages_delta(delta_link=delta_link, folder_id=folder_id)
+            mails = resp.get("value", [])
+
+            # 保存数据
+            if mails:
+                count = self.save_mails_to_db(group_id, mails)
+                total_synced += count
+
+            # 获取下一页或新的 deltaLink
+            delta_link = resp.get("@odata.nextLink")
+            new_delta_link = resp.get("@odata.deltaLink")
+
+            # 如果拿到了 deltaLink，说明本轮结束
+            if new_delta_link:
+                break
+
+        # 2. 更新文件夹状态
+        if new_delta_link:
+            self._update_folder_state(folder_id, {
+                "delta_link": new_delta_link,
+                "last_sync_at": sync_time,
+                "synced_count": folder["synced_count"] + total_synced
+            })
+
+        return {"synced": total_synced, "fetched": total_synced}
+
+    def _sync_folder_incremental(self, group_id: str, client: MSALClient, folder: Dict, sync_time: str, cb) -> Dict:
+        """策略：增量同步 (基于时间窗)"""
+        last_sync = folder["last_sync_at"]
+        filter_str = f"receivedDateTime gt {last_sync}"
+
+        return self._fetch_and_save_pages(
+            group_id, client, folder,
+            filter_str=filter_str,
+            sync_time_to_update=sync_time,
+            cb=cb
+        )
+
+    def _sync_folder_recent(self, group_id: str, client: MSALClient, folder: Dict, sync_time: str, cb) -> Dict:
+        """策略：最近邮件 (默认30天)"""
+        start_date = utc_days_ago(30)
+        filter_str = f"receivedDateTime gt {start_date}"
+
+        return self._fetch_and_save_pages(
+            group_id, client, folder,
+            filter_str=filter_str,
+            sync_time_to_update=sync_time,
+            try_enable_delta=True,
+            cb=cb
+        )
+
+    def _sync_folder_full(self, group_id: str, client: MSALClient, folder: Dict, sync_time: str, cb) -> Dict:
+        """策略：全量同步"""
+        return self._fetch_and_save_pages(
+            group_id, client, folder,
+            filter_str=None,
+            sync_time_to_update=sync_time,
+            try_enable_delta=True,
+            cb=cb
+        )
+
+    def _fetch_and_save_pages(
             self,
             group_id: str,
-            msal_client: MSALClient,
-            progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """
-        [保活策略] 仅请求用户信息，确认 Token 有效性
-        """
-        if progress_callback:
-            progress_callback(group_id, "正在执行保活检查...")
-
-        try:
-            # 调用轻量级接口
-            me = msal_client.get_me()
-            if me and "id" in me:
-                # 记录最后交互时间（可选，视数据库结构而定）
-                # update_last_interaction(group_id)
-                return {
-                    "success": True,
-                    "synced": 0,
-                    "message": "保活检查成功: Token有效"
-                }
-            else:
-                return {"success": False, "error": "无法获取用户信息"}
-        except Exception as e:
-            return {"success": False, "error": f"保活检查失败: {str(e)}"}
-
-
-    def get_sync_state(self, group_id: str) -> Dict[str, Any]:
-        """获取同步状态"""
-        try:
-            with get_db() as db:
-                row = db.execute("SELECT * FROM mail_sync_state WHERE group_id = ?", (group_id,)).fetchone()
-                if row:
-                    return dict(row)
-                else:
-                    return {}
-        except Exception as e:
-            return {}
-
-    def update_sync_state(self, group_id: str, state: Dict[str, Any]):
-        """更新同步状态"""
-        try:
-            with get_db() as db:
-                last_sync_time = state.get("last_sync_time")
-                if last_sync_time and not last_sync_time.endswith("Z"):
-                    from datetime import datetime
-                    try:
-                        dt = datetime.fromisoformat(last_sync_time.replace("Z", "+00:00"))
-                        last_sync_time = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    except (ValueError, AttributeError):
-                        last_sync_time = utc_now()
-
-                db.execute("""
-                INSERT INTO mail_sync_state (
-                    group_id, last_sync_time, last_msg_uid,
-                    delta_link, skip_token, total_synced, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(group_id) DO UPDATE SET
-                    last_sync_time = excluded.last_sync_time,
-                    last_msg_uid = excluded.last_msg_uid,
-                    delta_link = excluded.delta_link,
-                    skip_token = excluded.skip_token,
-                    total_synced = excluded.total_synced,
-                    updated_at = excluded.updated_at
-            """, (
-                group_id,
-                last_sync_time,
-                state.get("last_msg_uid"),
-                state.get("delta_link"),
-                state.get("skip_token"),
-                state.get("total_synced", 0),
-                utc_now(),
-            ))
-                db.commit()
-        except Exception as e:
-            print(f"更新同步状态失败: {e}")
-
-    def get_primary_account_id(self, group_id: str) -> Optional[int]:
-        """获取组的主账号ID（用于显示进度）"""
-        with get_db() as db:
-            result = db.execute(
-                "SELECT id FROM accounts WHERE group_id = ? ORDER BY id LIMIT 1",
-                (group_id,)
-            ).fetchone()
-            return result["id"] if result else None
-
-    def _get_all_folders(self, msal_client: MSALClient) -> List[Dict[str, Any]]:
-        """获取所有邮件文件夹"""
-        all_folders = []
-        try:
-            response = msal_client.list_mail_folders()
-            folders = response.get("value", [])
-
-            for folder in folders:
-                folder_info = {
-                    "id": folder["id"],
-                    "name": folder.get("displayName", "Unknown"),
-                    "total": folder.get("totalItemCount", 0),
-                    "unread": folder.get("unreadItemCount", 0),
-                }
-                all_folders.append(folder_info)
-
-            return all_folders
-        except Exception as e:
-            print(f"获取文件夹列表失败: {e}")
-            return []
-
-    def sync_with_delta(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        sync_state: Dict,
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """使用Delta查询同步"""
-        primary_account_id = self.get_primary_account_id(group_id)
-
-        if progress_callback:
-            if primary_account_id:
-                progress_callback(group_id, f"[账号{primary_account_id}] 使用Delta查询获取所有文件夹的变更...")
-
-        all_folders = self._get_all_folders(msal_client)
-        if not all_folders:
-            return {"success": False, "error": "未找到文件夹", "synced": 0}
-
-        total_synced = 0
-        folder_delta_links = sync_state.get("folder_delta_links", {})
-        new_folder_delta_links = {}
-
-        for folder in all_folders:
-            folder_id = folder["id"]
-            folder_name = folder["name"]
-
-            if folder["total"] == 0:
-                continue
-
-            if progress_callback:
-                progress_callback(group_id, f"[账号{primary_account_id}] 同步文件夹: {folder_name} (Delta)")
-
-            try:
-                delta_link = folder_delta_links.get(folder_id)
-                new_mails = []
-
-                if delta_link:
-                    response = msal_client.get_messages_delta(delta_link, folder_id=folder_id)
-                else:
-                    response = msal_client.get_messages_delta(folder_id=folder_id)
-
-                mails = response.get("value", [])
-                new_mails.extend(mails)
-
-                # 处理分页
-                batch_count = 1
-                while "@odata.nextLink" in response and batch_count < 50:
-                    response = msal_client.get_messages_delta(response["@odata.nextLink"])
-                    mails = response.get("value", [])
-                    new_mails.extend(mails)
-                    batch_count += 1
-
-                # 保存邮件
-                if new_mails:
-                    synced = self.save_mails_to_db(group_id, new_mails, progress_callback)
-                    total_synced += synced
-
-                # 保存该文件夹的 delta link
-                new_delta_link = response.get("@odata.deltaLink")
-                if new_delta_link:
-                    new_folder_delta_links[folder_id] = new_delta_link
-
-            except Exception as e:
-                print(f"Delta 同步文件夹 {folder_name} 失败: {e}")
-                continue
-
-        return {
-            "success": True,
-            "synced": total_synced,
-            "total_fetched": total_synced,
-            "sync_state": {
-                "folder_delta_links": new_folder_delta_links,
-                "last_sync_time": utc_now(),
-                "total_synced": sync_state.get("total_synced", 0) + total_synced,
-            },
-        }
-
-    def sync_incremental(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        sync_state: Dict,
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """增量同步（基于时间）"""
-        last_sync_time = sync_state.get("last_sync_time")
-        if not last_sync_time:
-            if progress_callback:
-                progress_callback(group_id, "未找到上次同步时间，改为获取最近30天邮件")
-            return self.sync_recent(group_id, msal_client, progress_callback)
-
-        primary_account_id = self.get_primary_account_id(group_id)
-
-        if progress_callback:
-            if primary_account_id:
-                progress_callback(group_id, f"[账号{primary_account_id}] 获取所有文件夹在 {last_sync_time} 之后的邮件...")
-
-        all_folders = self._get_all_folders(msal_client)
-        if not all_folders:
-            return {"success": False, "error": "未找到文件夹", "synced": 0}
-
+            client: MSALClient,
+            folder: Dict,
+            filter_str: Optional[str],
+            sync_time_to_update: str,
+            try_enable_delta: bool = False,
+            cb: Callable = None
+    ) -> Dict:
+        """通用分页拉取与保存逻辑"""
+        # TODO 详细进度同步
+        folder_id = folder["folder_id"]
         total_synced = 0
         total_fetched = 0
 
-        for folder in all_folders:
-            folder_id = folder["id"]
-            folder_name = folder["name"]
+        skip_token = None
 
-            if folder["total"] == 0:
-                continue
-
-            if progress_callback:
-                progress_callback(group_id, f"[账号{primary_account_id}] 同步文件夹: {folder_name} (增量)")
-
-            result = self._sync_folder_incremental(
-                group_id, msal_client, folder_id, folder_name, last_sync_time, progress_callback
-            )
-
-            total_synced += result.get("synced", 0)
-            total_fetched += result.get("fetched", 0)
-
-        new_sync_time = utc_now()
-
-        return {
-            "success": True,
-            "synced": total_synced,
-            "total_fetched": total_fetched,
-            "sync_state": {
-                "last_sync_time": new_sync_time,
-                "total_synced": sync_state.get("total_synced", 0) + total_synced,
-            },
-        }
-
-    def _sync_folder_incremental(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        folder_id: str,
-        folder_name: str,
-        last_sync_time: str,
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """增量同步单个文件夹"""
-        try:
-            filter_str = f"receivedDateTime gt {last_sync_time}"
-            all_mails = []
-            skip_token = None
-            batch_count = 0
-
-            while batch_count < 20:
-                response = msal_client.list_messages(
-                    folder_id=folder_id,
-                    top=50,
-                    filter_str=filter_str,
-                    orderby="receivedDateTime desc",
-                    skip_token=skip_token,
-                    select=[
-                        "id", "subject", "from", "toRecipients", "ccRecipients",
-                        "receivedDateTime", "sentDateTime", "isRead", "hasAttachments",
-                        "bodyPreview", "internetMessageId", "parentFolderId",
-                    ],
-                )
-
-                mails = response.get("value", [])
-                if not mails:
-                    break
-
-                all_mails.extend(mails)
-
-                next_link = response.get("@odata.nextLink")
-                if next_link:
-                    match = re.search(r"\$skiptoken=([^&]+)", next_link)
-                    skip_token = match.group(1) if match else None
-                else:
-                    break
-
-                batch_count += 1
-
-            synced = self.save_mails_to_db(group_id, all_mails, progress_callback)
-            return {"synced": synced, "fetched": len(all_mails)}
-
-        except Exception as e:
-            print(f"增量同步文件夹 {folder_name} 失败: {e}")
-            return {"synced": 0, "fetched": 0}
-
-    def sync_recent(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-        days: int = 30,
-    ) -> Dict[str, Any]:
-        """同步最近的邮件"""
-        primary_account_id = self.get_primary_account_id(group_id)
-
-        if progress_callback:
-            if primary_account_id:
-                progress_callback(group_id, f"[账号{primary_account_id}] 获取所有文件夹最近 {days} 天的邮件...")
-
-        all_folders = self._get_all_folders(msal_client)
-        if not all_folders:
-            return {"success": False, "error": "未找到文件夹", "synced": 0}
-
-        total_synced = 0
-        total_fetched = 0
-        start_date = utc_days_ago(days)
-
-        for folder in all_folders:
-            folder_id = folder["id"]
-            folder_name = folder["name"]
-
-            if folder["total"] == 0:
-                continue
-
-            if progress_callback:
-                progress_callback(group_id, f"[账号{primary_account_id}] 同步文件夹: {folder_name} (最近 {days} 天)")
-
-            result = self._sync_folder_recent(
-                group_id, msal_client, folder_id, folder_name, start_date, progress_callback
-            )
-
-            total_synced += result.get("synced", 0)
-            total_fetched += result.get("fetched", 0)
-
-        return {
-            "success": True,
-            "synced": total_synced,
-            "total_fetched": total_fetched,
-            "sync_state": {
-                "last_sync_time": utc_now(),
-                "total_synced": total_synced,
-            },
-        }
-
-    def _sync_folder_recent(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        folder_id: str,
-        folder_name: str,
-        start_date: str,
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-        max_mails: int = 500,
-    ) -> Dict[str, Any]:
-        """同步单个文件夹最近的邮件"""
-        try:
-            filter_str = f"receivedDateTime gt {start_date}"
-            all_mails = []
-            skip_token = None
-            batch_count = 0
-
-            while len(all_mails) < max_mails and batch_count < 20:
-                response = msal_client.list_messages(
-                    folder_id=folder_id,
-                    top=50,
-                    filter_str=filter_str,
-                    orderby="receivedDateTime desc",
-                    skip_token=skip_token,
-                    select=[
-                        "id", "subject", "from", "toRecipients", "ccRecipients",
-                        "receivedDateTime", "sentDateTime", "isRead", "hasAttachments",
-                        "bodyPreview", "internetMessageId", "parentFolderId",
-                    ],
-                )
-
-                mails = response.get("value", [])
-                if not mails:
-                    break
-
-                all_mails.extend(mails)
-
-                next_link = response.get("@odata.nextLink")
-                if next_link:
-                    match = re.search(r"\$skiptoken=([^&]+)", next_link)
-                    skip_token = match.group(1) if match else None
-                else:
-                    break
-
-                batch_count += 1
-
-            synced = self.save_mails_to_db(group_id, all_mails, progress_callback)
-            return {"synced": synced, "fetched": len(all_mails)}
-
-        except Exception as e:
-            print(f"同步文件夹 {folder_name} 失败: {e}")
-            return {"synced": 0, "fetched": 0}
-
-    def sync_full(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        sync_state: Dict,
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """完整同步"""
-        primary_account_id = self.get_primary_account_id(group_id)
-
-        if progress_callback:
-            if primary_account_id:
-                progress_callback(group_id, f"[账号{primary_account_id}] 开始完整同步所有文件夹...")
-
-        try:
-            all_folders = self._get_all_folders(msal_client)
-            if not all_folders:
-                return {"success": False, "error": "未找到任何文件夹", "synced": 0}
-
-            all_folders.sort(key=lambda f: f["total"], reverse=True)
-
-            if progress_callback:
-                total_mails = sum(f["total"] for f in all_folders)
-                progress_callback(group_id, f"[账号{primary_account_id}] 找到 {len(all_folders)} 个文件夹，共 {total_mails} 封邮件")
-
-            all_synced = 0
-            all_fetched = 0
-
-            for folder in all_folders:
-                folder_id = folder["id"]
-                folder_name = folder["name"]
-
-                if folder["total"] == 0:
-                    continue
-
-                if progress_callback:
-                    progress_callback(group_id, f"[账号{primary_account_id}] 正在同步文件夹: {folder_name} ({folder['total']} 封)")
-
-                result = self._sync_folder_full(
-                    group_id, msal_client, folder, None, progress_callback
-                )
-
-                all_synced += result.get("synced", 0)
-                all_fetched += result.get("fetched", 0)
-
-            return {
-                "success": True,
-                "synced": all_synced,
-                "total_fetched": all_fetched,
-                "sync_state": {
-                    "last_sync_time": utc_now(),
-                    "total_synced": sync_state.get("total_synced", 0) + all_synced,
-                },
-            }
-
-        except Exception as e:
-            return {"success": False, "error": f"完整同步失败: {str(e)}", "synced": 0}
-
-    def _sync_folder_full(
-        self,
-        group_id: str,
-        msal_client: MSALClient,
-        folder: Dict,
-        skip_token: Optional[str],
-        progress_callback: Optional[Callable[[str, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """同步单个文件夹的所有邮件"""
-        folder_id = folder["id"]
-        folder_name = folder["name"]
-
-        all_mails = []
+        batch_limit = 50  # 安全限制：防止无限循环
         batch_count = 0
-        total_saved = 0
-        max_batches = 100
 
-        try:
-            while batch_count < max_batches:
-                response = msal_client.list_messages(
-                    folder_id=folder_id,
-                    top=50,
-                    orderby="receivedDateTime desc",
-                    skip_token=skip_token,
-                    select=[
-                        "id", "subject", "from", "toRecipients", "ccRecipients",
-                        "receivedDateTime", "sentDateTime", "isRead", "hasAttachments",
-                        "bodyPreview", "internetMessageId", "parentFolderId",
-                    ],
-                )
+        while batch_count < batch_limit:
+            resp = client.list_messages(
+                folder_id=folder_id,
+                top=50,
+                filter_str=filter_str,
+                orderby="receivedDateTime desc",
+                skip_token=skip_token,
+                select=[
+                    "id", "subject", "from", "toRecipients", "ccRecipients",
+                    "receivedDateTime", "sentDateTime", "isRead", "hasAttachments",
+                    "bodyPreview", "internetMessageId", "parentFolderId",
+                ]
+            )
 
-                mails = response.get("value", [])
-                if not mails:
-                    break
+            mails = resp.get("value", [])
+            if not mails:
+                break
 
-                all_mails.extend(mails)
+            count = self.save_mails_to_db(group_id, mails, cb)
+            total_synced += count
+            total_fetched += len(mails)
 
-                next_link = response.get("@odata.nextLink")
-                if next_link:
-                    match = re.search(r"\$skiptoken=([^&]+)", next_link)
-                    skip_token = match.group(1) if match else None
-                else:
-                    break
+            # 下一页
+            next_link = resp.get("@odata.nextLink")
+            if next_link:
+                # 简单解析 skipToken
+                match = re.search(r"\$skiptoken=([^&]+)", next_link)
+                skip_token = match.group(1) if match else None
+                if not skip_token: break  # 防御，避免死循环
+            else:
+                break
 
-                batch_count += 1
+            batch_count += 1
 
-                # 定期保存邮件
-                if len(all_mails) >= 200:
-                    saved_count = self.save_mails_to_db(group_id, all_mails, progress_callback)
-                    total_saved += saved_count
-                    all_mails = []
+        # 更新文件夹状态
+        update_data = {
+            "last_sync_at": sync_time_to_update,
+            "synced_count": (folder["synced_count"] or 0) + total_synced
+        }
 
-            # 保存剩余的邮件
-            if all_mails:
-                saved_count = self.save_mails_to_db(group_id, all_mails, progress_callback)
-                total_saved += saved_count
+        # 如果需要开启 Delta (通常在首次同步后)，尝试请求一次 Delta Link 以备下次使用
+        # 只有当本次拉取成功且有数据时才尝试
+        if try_enable_delta:
+            try:
+                # 请求一个空的 delta 哪怕不拿数据，只为了拿到 Link
+                # 注意：这里需要捕获异常，因为某些文件夹可能不支持 Delta
+                delta_resp = client.get_messages_delta(folder_id=folder_id)
+                if "@odata.deltaLink" in delta_resp:
+                    update_data["delta_link"] = delta_resp["@odata.deltaLink"]
+            except Exception:
+                pass  # 忽略 Delta 获取失败，回退到基于时间同步
 
-            return {"synced": total_saved, "fetched": total_saved, "skip_token": skip_token}
+        self._update_folder_state(folder_id, update_data)
 
-        except Exception as e:
-            print(f"同步文件夹 {folder_name} 失败: {e}")
-            return {"synced": 0, "fetched": 0, "skip_token": skip_token}
+        return {"synced": total_synced, "fetched": total_fetched}
 
     def save_mails_to_db(
-        self,
-        group_id: str,
-        mails: List[Dict],
-        progress_callback: Optional[Callable[[str, str], None]] = None,
+            self,
+            group_id: str,
+            mails: List[Dict],
+            progress_callback: Optional[Callable[[str, str], None]] = None,
     ) -> int:
-        """批量保存邮件到数据库"""
+        """
+        [重写] 将邮件数据序列化并推送到 Redis 队列
+        """
         if not mails:
             return 0
+        items_to_push = []
 
-        primary_account_id = self.get_primary_account_id(group_id)
-
-        if progress_callback and primary_account_id:
-            progress_callback(group_id, f"[账号{primary_account_id}] 正在保存 {len(mails)} 封邮件到数据库...")
-
-        saved_count = 0
-
-        mail_data_list = []
         for mail in mails:
             try:
-                mail_data = self.prepare_mail_data(group_id, mail)
-                mail_data_list.append(mail_data)
+                flags_list = []
+                if mail.get("isRead"): flags_list.append("Read")
+                if mail.get("flag", {}).get("flagStatus") == "flagged": flags_list.append("Flagged")
+                flags_str = ";".join(flags_list) if flags_list else "UNREAD"
+
+                has_attachments = 1 if mail.get("hasAttachments") else 0
+                to_recipients = [r.get("emailAddress", {}).get("address", "") for r in mail.get("toRecipients", [])]
+                to_joined = ",".join(filter(None, to_recipients))
+                msg_payload = {
+                    "table": "mail_message",
+                    "data": {
+                        "group_id": group_id,
+                        "msg_uid": mail.get("id"),
+                        "msg_id": mail.get("internetMessageId"),
+                        "subject": mail.get("subject", ""),
+                        "from_addr": mail.get("from", {}).get("emailAddress", {}).get("address", ""),
+                        "from_name": mail.get("from", {}).get("emailAddress", {}).get("name", ""),
+                        "to_joined": to_joined,
+                        "snippet": mail.get("bodyPreview", ""),
+                        "folder_id": mail.get("parentFolderId"),
+                        "sent_at": mail.get("sentDateTime"),
+                        "received_at": mail.get("receivedDateTime"),
+                        "size_bytes": mail.get("size", 0),
+                        "has_attachments": has_attachments,  # 0 或 1
+                        "flags": flags_str,
+                        "created_at": str(utc_now()),
+                        "updated_at": str(utc_now())
+                    }
+                }
+
+                # 序列化为 JSON 字符串 (default=str 处理 datetime 对象)
+                items_to_push.append(json.dumps(msg_payload, default=str))
+
             except Exception as e:
-                print(f"准备邮件数据失败: {e}")
+                # 打印日志但不中断循环，防止单封邮件格式错误导致整批失败
+                print(f"Async prepare failed for mail {mail.get('id', 'unknown')}: {e}")
                 continue
-        with get_db() as db:
+
+        # 3. 批量推送到 Redis (使用 Pipeline 提高性能)
+        if items_to_push:
             try:
-                batch_size = 100
-                account_record = db.execute(
-                    "SELECT id FROM accounts WHERE group_id = ? LIMIT 1",
-                    (group_id,)
-                ).fetchone()
-                account_id = account_record["id"] if account_record else None
+                pipe = redis_client.pipeline()
+                for item in items_to_push:
+                    pipe.lpush(RedisKeys.DB_WRITE_QUEUE, item)
+                pipe.execute()
+                # 触发进度回调
+                if progress_callback:
+                    progress_callback(group_id, f"已缓冲 {len(items_to_push)} 封")
 
-                for i in range(0, len(mail_data_list), batch_size):
-                    batch = mail_data_list[i:i+batch_size]
-
-                    mail_values = []
-                    for mail_data in batch:
-                        mail_values.append((
-                            mail_data["group_id"],
-                            account_id,
-                            mail_data["msg_uid"],
-                            mail_data["msg_id"],
-                            mail_data["subject"],
-                            mail_data["from_addr"],
-                            mail_data["from_name"],
-                            ",".join(mail_data["to"]) if mail_data["to"] else "",
-                            mail_data["folder_id"],
-                            mail_data["sent_at"],
-                            mail_data["received_at"],
-                            mail_data["snippet"],
-                            mail_data["flags"],
-                            mail_data["has_attachments"],
-                            utc_now()
-                        ))
-
-                    cursor = db.cursor()
-                    cursor.executemany("""
-                        INSERT OR IGNORE INTO mail_message (
-                            group_id, account_id, msg_uid, msg_id, subject, from_addr, from_name,
-                            to_joined, folder_id, sent_at, received_at, snippet,
-                            flags, has_attachments, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, mail_values)
-
-                    saved_count += cursor.rowcount
-                    db.commit()
-
+                return len(items_to_push)
             except Exception as e:
-                print(f"批量保存邮件失败: {e}")
-                db.rollback()
-                return saved_count
+                print(f"Redis push failed: {e}")
+                return 0
 
-        return saved_count
-
-    def prepare_mail_data(self, group_id: str, mail: Dict) -> Dict:
-        """准备邮件数据用于保存"""
-        to_recipients = [r.get("emailAddress", {}).get("address", "") for r in mail.get("toRecipients", [])]
-        cc_recipients = [r.get("emailAddress", {}).get("address", "") for r in mail.get("ccRecipients", [])]
-
-        from_addr = ""
-        from_name = ""
-        if mail.get("from"):
-            from_addr = mail["from"].get("emailAddress", {}).get("address", "")
-            from_name = mail["from"].get("emailAddress", {}).get("name", "")
-
-        sent_at = mail.get("sentDateTime")
-        received_at = mail.get("receivedDateTime")
-
-        mail_data = {
-            "group_id": group_id,
-            "msg_uid": mail.get("id", ""),
-            "msg_id": mail.get("internetMessageId", ""),
-            "subject": mail.get("subject", ""),
-            "from_addr": from_addr,
-            "from_name": from_name,
-            "to": to_recipients,
-            "cc": cc_recipients,
-            "folder_id": mail.get("parentFolderId", ""),
-            "sent_at": sent_at,
-            "received_at": received_at,
-            "snippet": mail.get("bodyPreview", ""),
-            "flags": 0 if mail.get("isRead", False) else 1,
-            "attachments_count": len(mail.get("attachments", [])),
-        }
-        return mail_data
+        return 0

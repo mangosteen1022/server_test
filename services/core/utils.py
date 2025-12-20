@@ -3,8 +3,9 @@ import json
 import traceback
 from curl_cffi import BrowserType
 from functools import wraps
-from typing import Union, Tuple
+from typing import Union, Tuple, Dict, Any, Optional
 
+from utils import utc_now
 
 
 def capture_error(

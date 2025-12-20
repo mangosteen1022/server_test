@@ -6,7 +6,6 @@ from typing import Optional, List, Dict, Any, Tuple, Callable
 
 import redis
 import requests
-from fastapi import HTTPException
 
 import settings
 from auth.msal_client import MSALClient
@@ -411,101 +410,6 @@ class MailService:
             "pages": (total + size - 1) // size
         }
 
-    def download_mail(self, message_id: int):
-        # 获取邮件基本信息
-        with get_db() as db:
-            mail = db.execute(
-                "SELECT account_id, msg_uid FROM mail_message WHERE id=?", (message_id,)
-            ).fetchone()
-
-            if not mail:
-                raise HTTPException(404, "邮件不存在")
-
-            account_id = mail["account_id"]
-            msg_uid = mail["msg_uid"]
-
-            if not msg_uid:
-                raise HTTPException(400, "邮件ID无效，无法从Graph API获取")
-
-            # 获取账号的group_id
-            account = db.execute(
-                "SELECT group_id FROM accounts WHERE id=?", (account_id,)
-            ).fetchone()
-
-            if not account:
-                raise HTTPException(404, "账号不存在")
-
-            group_id = account["group_id"]
-
-            # 获取账号的token缓存（使用group_id）
-            token_cache_row = db.execute(
-                "SELECT uuid FROM account_token_cache WHERE group_id=? LIMIT 1",
-                (group_id,)
-            ).fetchone()
-
-            if not token_cache_row:
-                raise HTTPException(400, "账号未登录或token已过期")
-
-        try:
-            # 创建MSAL客户端
-            msal_client = MSALClient(
-                client_id=settings.MSAL_CLIENT_ID,
-                authority=settings.MSAL_AUTHORITY,
-                scopes=settings.MSAL_SCOPES,
-                token_uuid=token_cache_row["uuid"]
-            )
-
-            # 检查token是否有效
-            token = msal_client.get_access_token()
-            if not token:
-                raise HTTPException(400, "账号未登录或token已过期")
-
-            # 从Graph API获取完整邮件
-            mail_data = msal_client._graph_request(
-                "GET",
-                f"me/messages/{msg_uid}",
-                params={"$select": "*"}
-            )
-            # 提取邮件数据
-            headers = mail_data.get("internetMessageHeaders", [])
-            headers_str = "\n".join([f"{h.get('name', '')}: {h.get('value', '')}" for h in headers])
-
-            body_html = mail_data.get("body", {}).get("content", "")
-            body_plain = ""  # 如果需要纯文本，可以从MIME内容解析
-
-            # 更新邮件正文表
-            with get_db() as db:
-                begin_tx(db)
-                db.execute(
-                    """
-                    INSERT OR REPLACE INTO mail_body (message_id, headers, body_plain, body_html)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (message_id, headers_str, body_plain, body_html)
-                )
-                commit_tx(db)
-            return {
-                "success": True,
-                "message": "邮件内容下载成功",
-                "mail_data": {
-                    "id": message_id,
-                    "subject": mail_data.get("subject", ""),
-                    "from": mail_data.get("from", {}),
-                    "toRecipients": mail_data.get("toRecipients", []),
-                    "ccRecipients": mail_data.get("ccRecipients", []),
-                    "receivedDateTime": mail_data.get("receivedDateTime"),
-                    "body_html": body_html,
-                    "body_plain": body_plain,
-                    "attachments": mail_data.get("attachments", [])
-                }
-            }
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(500, f"下载邮件内容失败: {str(e)}")
-
     def batch_download_content(self, message_ids: List[int], max_workers: int = 10,
                                progress_callback: Optional[Callable[[int, int], None]] = None
                                ) -> Dict[str, Any]:
@@ -521,31 +425,24 @@ class MailService:
 
         with get_db() as db:
             # 联查: 邮件ID -> msg_uid -> token_uuid
-            query = f"""
-                SELECT 
-                    m.id as message_id, 
-                    m.msg_uid, 
-                    c.uuid as token_uuid
-                FROM mail_message m
-                JOIN accounts a ON m.account_id = a.id
-                JOIN account_token_cache c ON a.group_id = c.group_id
-                LEFT JOIN mail_body b ON m.id = b.message_id
-                WHERE m.id IN ({placeholders})
-                  AND b.message_id IS NULL
-            """
+            query = f"""SELECT 
+                            m.id as message_id, 
+                            m.msg_uid, 
+                            m.group_id
+                        FROM mail_message m
+                        LEFT JOIN mail_body b ON m.id = b.message_id
+                        WHERE m.id IN ({placeholders})
+                          AND b.message_id IS NULL
+                        """
             rows = db.execute(query, message_ids).fetchall()
             tasks_metadata = [dict(row) for row in rows]
 
-        total_requested = len(message_ids)
-        to_download_count = len(tasks_metadata)
-        skipped_count = total_requested - to_download_count
+        total_requested = len(message_ids) # 总数量
+        skipped_count = total_requested - len(tasks_metadata)  # 已经下载的邮件数量,跳过
 
         if not tasks_metadata:
             if progress_callback:
-                try:
-                    progress_callback(total_requested, total_requested)
-                except:
-                    pass
+                progress_callback(total_requested, total_requested) # 全部下载完成
             return {
                 "success": True,
                 "total_requested": total_requested,
@@ -556,26 +453,33 @@ class MailService:
             }
 
         # --- 2. 预取 Token ---
-        unique_token_uuids = set(t["token_uuid"] for t in tasks_metadata)
         valid_tokens = {}
-        auth_errors = []
+        auth_errors = {}
 
-        for uuid in unique_token_uuids:
+        for task in tasks_metadata:
+            gid = task["group_id"]
+            message_id = task['message_id']
+            if gid in valid_tokens:
+                valid_tokens[gid]["tasks"].append(task)
+                continue
+            if gid in auth_errors:
+                auth_errors[gid].append(message_id)
+                continue
             try:
                 msal_client = MSALClient(
                     client_id=settings.MSAL_CLIENT_ID,
                     authority=settings.MSAL_AUTHORITY,
                     scopes=settings.MSAL_SCOPES,
-                    token_uuid=uuid
+                    group_id=gid
                 )
                 token = msal_client.get_access_token()
                 if token:
-                    valid_tokens[uuid] = token
+                    valid_tokens[gid] = {"token":token,"tasks":[task]}
                 else:
-                    auth_errors.append(uuid)
+                    auth_errors[gid] = [message_id]
             except Exception as e:
-                logger.error(f"Token fetch failed for {uuid}: {e}")
-                auth_errors.append(uuid)
+                logger.error(f"Token fetch failed for {gid}: {e}")
+                auth_errors[gid] = [message_id]
 
         # --- 3. 定义轻量级下载任务 (包含附件元数据) ---
         def _lightweight_download(meta, access_token):
@@ -585,7 +489,10 @@ class MailService:
                     "Authorization": f"Bearer {access_token}",
                     "Content-Type": "application/json"
                 }
-                params = {"$select": "internetMessageHeaders,body,subject"}
+                params = {
+                    "$select": "internetMessageHeaders,body,subject",
+                    "$expand": "attachments($select=id,name,contentType,size,isInline,contentId)"
+                }
                 resp = requests.get(url, headers=headers, params=params, timeout=10)
                 if resp.status_code != 200:
                     return {"error": f"Msg {meta['message_id']} HTTP {resp.status_code}"}
@@ -593,32 +500,51 @@ class MailService:
                 # 解析正文
                 headers_list = data.get("internetMessageHeaders", [])
                 headers_str = "\n".join([f"{h.get('name', '')}: {h.get('value', '')}" for h in headers_list])
-                body_html = data.get("body", {}).get("content", "")
+                body_obj = data.get("body", {})
+                body_html = body_obj.get("content", "") if body_obj.get("contentType") == "html" else ""
+                body_plain = body_obj.get("content", "") if body_obj.get("contentType") == "text" else ""
 
+                attachments_data = []
+                if data.get("attachments"):
+                    for att in data["attachments"]:
+                        if not att.get("id"):
+                            continue
+                        attachments_data.append({
+                            "message_id": meta["message_id"],  # 关联本地邮件ID
+                            "attachment_id": att.get("id"),  # Graph API 的附件ID
+                            "filename": att.get("name"),
+                            "content_type": att.get("contentType"),
+                            "size": att.get("size"),
+                            "is_inline": 1 if att.get("isInline") else 0,
+                            "content_id": att.get("contentId"),
+                            "download_status": "PENDING"
+                        })
                 return {
                     "message_id": meta["message_id"],
                     "headers": headers_str,
                     "body_html": body_html,
-                    "body_plain": "",
+                    "body_plain": body_plain,
+                    "attachments_data":attachments_data
                 }
+            except requests.exceptions.Timeout:
+                return {"message_id": meta['message_id'], "error": "Request timeout"}
+            except requests.exceptions.RequestException as e:
+                return {"message_id": meta['message_id'], "error": f"Request failed: {e}"}
             except Exception as e:
-                return {"error": f"Msg {meta['message_id']} Exception: {str(e)}"}
+                logger.exception(f"Download failed for message {meta['message_id']}")
+                return {"message_id": meta['message_id'], "error": str(e)}
 
         # --- 4. 并发执行 ---
         success_results = []
         download_errors = []
-        completed_count = 0
-        total_tasks = len(tasks_metadata)
-
+        completed_count = skipped_count + sum(len(v) for v in auth_errors.values()) # 排除掉失败后的起始数
+        progress_callback(completed_count, total_requested)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
-            for meta in tasks_metadata:
-                uuid = meta["token_uuid"]
-                if uuid in valid_tokens:
-                    token = valid_tokens[uuid]
-                    futures.append(executor.submit(_lightweight_download, meta, token))
-                else:
-                    download_errors.append(f"Msg {meta['message_id']}: Auth Failed")
+            for val in list(valid_tokens.values()):
+                token,tasks = val['token'],val['tasks']
+                for task in tasks:
+                    futures.append(executor.submit(_lightweight_download, task, token))
 
             for future in as_completed(futures):
                 res = future.result()
@@ -629,7 +555,7 @@ class MailService:
                 completed_count += 1
                 if progress_callback:
                     try:
-                        progress_callback(completed_count, total_tasks)
+                        progress_callback(completed_count, total_requested)
                     except Exception:
                         pass  # 忽略回调错误
 
@@ -650,6 +576,14 @@ class MailService:
                         }
                     }
                     pipe.lpush("sys:db_write_queue", json.dumps(payload, default=str))
+                    if item.get("attachments_data"):
+                        for atta in item.get("attachments_data"):
+                            payload = {
+                                "table": "mail_attachment",
+                                "data": atta
+                            }
+                            pipe.lpush("sys:db_write_queue", json.dumps(payload, default=str))
+
                 pipe.execute()
             except Exception as e:
                 logger.error(f"Batch save failed: {e}")
@@ -660,5 +594,6 @@ class MailService:
             "total_requested": total_requested,
             "skipped": skipped_count,
             "downloaded": len(success_results),
-            "errors": download_errors
+            "download_errors": download_errors,
+            "auth_errors": auth_errors
         }

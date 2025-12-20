@@ -118,13 +118,11 @@ def _flush_buffer(raw_items: List[bytes]):
 
     except Exception as e:
         logger.error(f"❌ DB Write Failed: {e}")
-        # 紧急避险：将数据塞回 Redis 队列头部 (Lpush)，防止数据丢失
-        # 注意：这可能会导致死循环如果数据本身有问题，生产环境需要 Dead Letter Queue (死信队列)
         logger.warning(f"Re-queuing {len(raw_items)} items...")
 
         pipe = redis_client.pipeline()
         for item in raw_items:
-            pipe.lpush(RedisKeys.DB_WRITE_QUEUE, item)
+            pipe.lpush(RedisKeys.DB_WRITE_FAILED, item)
         pipe.execute()
 
 

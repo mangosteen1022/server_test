@@ -66,7 +66,7 @@ async def get_current_admin(current_user: dict = Depends(get_current_user)):
 # ==================== 接口实现 ====================
 
 @router.post("/auth/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     """系统用户登录接口"""
     service = AuthService()
 

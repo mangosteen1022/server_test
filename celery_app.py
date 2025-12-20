@@ -28,6 +28,7 @@ celery_app.conf.update(
 # Redis Key 定义 (保持之前设计的逻辑)
 class RedisKeys:
     DB_WRITE_QUEUE = "sys:db_write_queue"
+    DB_WRITE_FAILED = "sys:db_write_failed"
     USER_CONCURRENCY_PREFIX = "sys:concurrency:user:"
     TASK_STATUS_TEMPLATE = "sys:status:user:{user_id}:type:{task_type}:group:{group_id}"
 

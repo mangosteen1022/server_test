@@ -3,7 +3,7 @@ import json
 from typing import List, Dict
 
 from celery_app import celery_app
-from services.tasks.worker import login_group_task, sync_group_task, _get_cached_token_uuid, sync_folders_task
+from services.tasks.worker import login_group_task, sync_group_task, sync_folders_task,get_token_from_db
 from services.tasks.utils import update_task_status, get_active_statuses_by_type, redis_client, get_task_status
 from utils.logger import get_logger
 
@@ -24,8 +24,8 @@ class OAuthService:
 
         # 2. 业务兜底 (Token有效则直接Success)
         if not force_relogin:
-            token_uuid = _get_cached_token_uuid(group_id)
-            if token_uuid:
+            token = get_token_from_db(group_id)
+            if token:
                 update_task_status(user_id, group_id, task_type, "SUCCESS", "已登录(缓存有效)", ttl=60)
                 return True
 
